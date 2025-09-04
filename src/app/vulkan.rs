@@ -1,6 +1,7 @@
 use std::{
     ffi::CStr,
     mem::MaybeUninit,
+    ops::Not,
     sync::{atomic::AtomicBool, Arc, Mutex, RwLock},
 };
 
@@ -108,6 +109,19 @@ impl VulkanApp {
             app: MaybeUninit::uninit(),
             initialized: AtomicBool::new(false),
         }
+    }
+
+    pub fn egui_handle_event(
+        &self,
+        event: winit::event::WindowEvent,
+    ) -> (Option<winit::event::WindowEvent>, egui_winit::EventResponse) {
+        let res = self
+            .egui_winit
+            .write()
+            .unwrap()
+            .on_window_event(&self.window, &event);
+
+        (res.consumed.not().then_some(event), res)
     }
 
     pub unsafe fn cleanup(&self) {

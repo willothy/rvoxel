@@ -59,6 +59,13 @@ impl ApplicationHandler for App {
             return;
         }
 
+        let (event, _) = self.vk.egui_handle_event(event);
+
+        let Some(event) = event else {
+            // egui handled the event
+            return;
+        };
+
         match event {
             winit::event::WindowEvent::CloseRequested => {
                 event_loop.exit();
