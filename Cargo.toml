@@ -1,0 +1,12 @@
+[package]
+name = "rvoxel"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = { version = "1.0.99", features = ["backtrace"] }
+ash = { version = "0.38.0", features = [] }
+ash-window = "0.13.0"
+raw-window-handle = { version = "0.6.2", features = ["std"] }
+tokio = { version = "1.47.1", features = ["full"] }
+winit = { version = "0.30.12", features = ["serde"] }
