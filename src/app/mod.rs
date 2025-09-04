@@ -42,7 +42,9 @@ impl ApplicationHandler for App {
             eprintln!("Failed to initialize application: {}", e);
         }
 
-        if let Err(e) = unsafe { self.vk.draw_frame() } {
+        let ui = self.vk.update_ui();
+
+        if let Err(e) = unsafe { self.vk.draw_frame(ui) } {
             eprintln!("Error: {e}")
         }
     }
@@ -63,9 +65,12 @@ impl ApplicationHandler for App {
             }
             winit::event::WindowEvent::RedrawRequested => {
                 self.vk.window.request_redraw();
-                if let Err(e) = unsafe { self.vk.draw_frame() } {
-                    eprintln!("Error: {e}")
-                }
+
+                // let ui = self.vk.update_ui();
+                //
+                // if let Err(e) = unsafe { self.vk.draw_frame(ui) } {
+                //     eprintln!("Error: {e}")
+                // }
             }
             _ => {}
         }

@@ -1,4 +1,8 @@
-use std::{ffi::CStr, mem::MaybeUninit, sync::atomic::AtomicBool};
+use std::{
+    ffi::CStr,
+    mem::MaybeUninit,
+    sync::{atomic::AtomicBool, Arc, Mutex, RwLock},
+};
 
 use anyhow::Context;
 use ash::{khr::surface, vk};
@@ -67,6 +71,14 @@ pub struct VulkanAppInner {
     render_pass: vk::RenderPass,
     graphics_pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
+
+    egui_ctx: egui::Context,
+    egui_winit: RwLock<egui_winit::State>,
+    egui_renderer: Mutex<egui_ash_renderer::Renderer>,
+
+    // debug_wireframe: bool,
+    debug_fps: f32,
+    debug_frame_time: f32,
 }
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
@@ -100,61 +112,61 @@ impl VulkanApp {
 
     pub unsafe fn cleanup(&self) {
         unsafe {
-            // Wait for all GPU work to finish before destroying anything
-            self.device.device_wait_idle().unwrap();
-
-            // Destroy synchronization objects (per-frame objects)
-            for i in 0..MAX_FRAMES_IN_FLIGHT {
-                self.device
-                    .destroy_semaphore(self.image_available_semaphores[i], None);
-                self.device
-                    .destroy_semaphore(self.render_finished_semaphores[i], None);
-                self.device.destroy_fence(self.in_flight_fences[i], None);
-            }
-
-            // Destroy command pool (automatically frees command buffers)
-            self.device.destroy_command_pool(self.command_pool, None);
-
-            // Destroy vertex buffer and its memory
-            self.device.destroy_buffer(self.vertex_buffer, None);
-            self.device.free_memory(self.vertex_buffer_memory, None);
-
-            // Destroy graphics pipeline and layout
-            self.device.destroy_pipeline(self.graphics_pipeline, None);
-            self.device
-                .destroy_pipeline_layout(self.pipeline_layout, None);
-
-            // Destroy framebuffers (one per swapchain image)
-            for &framebuffer in &self.swapchain_framebuffers {
-                self.device.destroy_framebuffer(framebuffer, None);
-            }
-
-            // Destroy image views (one per swapchain image)
-            for &image_view in &self.swapchain_image_views {
-                self.device.destroy_image_view(image_view, None);
-            }
-
-            // Destroy render pass
-            self.device.destroy_render_pass(self.render_pass, None);
-
-            // Destroy shader modules
-            self.device
-                .destroy_shader_module(self.vert_shader_module, None);
-            self.device
-                .destroy_shader_module(self.frag_shader_module, None);
-
-            // Destroy swapchain (note: images are destroyed automatically)
-            self.swapchain_loader
-                .destroy_swapchain(self.swapchain, None);
-
-            // Destroy surface
-            self.surface_loader.destroy_surface(self.surface, None);
-
-            // Destroy logical device
-            self.device.destroy_device(None);
-
-            // Destroy instance (last!)
-            self.instance.destroy_instance(None);
+            // // Wait for all GPU work to finish before destroying anything
+            // self.device.device_wait_idle().unwrap();
+            //
+            // // Destroy synchronization objects (per-frame objects)
+            // for i in 0..MAX_FRAMES_IN_FLIGHT {
+            //     self.device
+            //         .destroy_semaphore(self.image_available_semaphores[i], None);
+            //     self.device
+            //         .destroy_semaphore(self.render_finished_semaphores[i], None);
+            //     self.device.destroy_fence(self.in_flight_fences[i], None);
+            // }
+            //
+            // // Destroy command pool (automatically frees command buffers)
+            // self.device.destroy_command_pool(self.command_pool, None);
+            //
+            // // Destroy vertex buffer and its memory
+            // self.device.destroy_buffer(self.vertex_buffer, None);
+            // self.device.free_memory(self.vertex_buffer_memory, None);
+            //
+            // // Destroy graphics pipeline and layout
+            // self.device.destroy_pipeline(self.graphics_pipeline, None);
+            // self.device
+            //     .destroy_pipeline_layout(self.pipeline_layout, None);
+            //
+            // // Destroy framebuffers (one per swapchain image)
+            // for &framebuffer in &self.swapchain_framebuffers {
+            //     self.device.destroy_framebuffer(framebuffer, None);
+            // }
+            //
+            // // Destroy image views (one per swapchain image)
+            // for &image_view in &self.swapchain_image_views {
+            //     self.device.destroy_image_view(image_view, None);
+            // }
+            //
+            // // Destroy render pass
+            // self.device.destroy_render_pass(self.render_pass, None);
+            //
+            // // Destroy shader modules
+            // self.device
+            //     .destroy_shader_module(self.vert_shader_module, None);
+            // self.device
+            //     .destroy_shader_module(self.frag_shader_module, None);
+            //
+            // // Destroy swapchain (note: images are destroyed automatically)
+            // self.swapchain_loader
+            //     .destroy_swapchain(self.swapchain, None);
+            //
+            // // Destroy surface
+            // self.surface_loader.destroy_surface(self.surface, None);
+            //
+            // // Destroy logical device
+            // self.device.destroy_device(None);
+            //
+            // // Destroy instance (last!)
+            // self.instance.destroy_instance(None);
         }
     }
 
@@ -177,6 +189,17 @@ impl VulkanApp {
             .with_visible(true);
 
         let window = ev.create_window(attrs)?;
+
+        let egui_ctx = egui::Context::default();
+
+        let egui_winit = egui_winit::State::new(
+            egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            &window,
+            None,
+            None,
+            None,
+        );
 
         let instance = unsafe { Self::create_instance(&entry, &window)? };
 
@@ -236,6 +259,19 @@ impl VulkanApp {
             )?
         };
 
+        let egui_renderer = egui_ash_renderer::Renderer::with_default_allocator(
+            &instance,
+            physical_device.clone(),
+            device.clone(),
+            render_pass.clone(),
+            egui_ash_renderer::Options {
+                in_flight_frames: MAX_FRAMES_IN_FLIGHT,
+                enable_depth_test: false,
+                enable_depth_write: false,
+                srgb_framebuffer: true,
+            },
+        )?;
+
         let app_inner = VulkanAppInner {
             window,
             instance,
@@ -272,6 +308,11 @@ impl VulkanApp {
             render_pass,
             graphics_pipeline,
             pipeline_layout,
+            egui_ctx,
+            egui_winit: RwLock::new(egui_winit),
+            egui_renderer: Mutex::new(egui_renderer),
+            debug_fps: 0.,
+            debug_frame_time: 0.,
         };
 
         self.app = MaybeUninit::new(app_inner);
@@ -292,7 +333,7 @@ impl VulkanApp {
         Ok(uninit)
     }
 
-    pub unsafe fn draw_frame(&mut self) -> anyhow::Result<()> {
+    pub unsafe fn draw_frame(&mut self, ui: egui::FullOutput) -> anyhow::Result<()> {
         unsafe {
             self.device.wait_for_fences(
                 &[self.in_flight_fences[self.current_frame]],
@@ -320,7 +361,7 @@ impl VulkanApp {
         };
 
         // Step 4: Record commands
-        self.record_command_buffer(self.command_buffers[self.current_frame], image_index)?;
+        self.record_command_buffer(self.command_buffers[self.current_frame], image_index, ui)?;
 
         // Step 5: Submit commands to GPU
         unsafe { self.submit_commands()? };
@@ -442,6 +483,7 @@ impl VulkanApp {
         &self,
         command_buffer: vk::CommandBuffer,
         image_idx: u32,
+        ui: egui::FullOutput,
     ) -> anyhow::Result<()> {
         // Start recording
         let begin_info = vk::CommandBufferBeginInfo::default();
@@ -501,6 +543,44 @@ impl VulkanApp {
                 0, // first instance
             )
         };
+
+        // UI
+        // In record_command_buffer, after your triangle rendering but before cmd_end_render_pass:
+
+        // Get egui render data
+        let output = ui;
+        let clipped_primitives = self
+            .egui_ctx
+            .tessellate(output.shapes, output.pixels_per_point);
+
+        // Render egui
+        if !clipped_primitives.is_empty() {
+            println!(
+                "Rendering egui with {} clipped primitives",
+                clipped_primitives.len()
+            );
+
+            let mut renderer = self.egui_renderer.lock().unwrap();
+
+            renderer.set_textures(
+                self.graphics_queue,
+                self.command_pool,
+                &output.textures_delta.set,
+            )?;
+
+            if let Err(e) = renderer.cmd_draw(
+                command_buffer,
+                vk::Extent2D {
+                    width: self.swapchain_extent.width,
+                    height: self.swapchain_extent.height,
+                },
+                output.pixels_per_point,
+                &clipped_primitives,
+                // &output.textures_delta,
+            ) {
+                println!("Failed to render egui: {}", e);
+            }
+        }
 
         // End render pass
         unsafe { self.device.cmd_end_render_pass(command_buffer) };
@@ -854,6 +934,50 @@ impl VulkanApp {
             render_finished_semaphores,
             in_flight_fences,
         ))
+    }
+
+    pub fn update_ui(&mut self) -> egui::FullOutput {
+        let raw_input = {
+            let mut egui_winit = self.egui_winit.write().unwrap();
+
+            egui_winit.take_egui_input(&self.window)
+        };
+
+        // self.egui_ctx.begin_pass(raw_input);
+
+        // self.draw_debug_ui(&self.egui_ctx);
+
+        self.egui_ctx.run(raw_input, |ctx| {
+            self.draw_debug_ui(ctx);
+        })
+    }
+
+    fn draw_debug_ui(&self, ctx: &egui::Context) {
+        // egui::TopBottomPanel::bottom(egui::Id::new("debug_ui"))
+        egui::SidePanel::new(egui::panel::Side::Left, egui::Id::new("debug_ui")).show(ctx, |ui| {
+            ui.heading("Performance");
+            ui.label(format!("FPS: {:.1}", self.debug_fps));
+            ui.label(format!(
+                "Frame time: {:.3}ms",
+                self.debug_frame_time * 1000.0
+            ));
+
+            // ui.separator();
+
+            ui.heading("Rendering");
+            // ui.checkbox(&mut self.debug_wireframe, "Wireframe mode");
+
+            // if ui.button("Reset Camera") {
+            //     // TODO: Reset camera when we add it
+            //     println!("Camera reset!");
+            // }
+
+            // ui.separator();
+
+            ui.heading("Voxels");
+            ui.label("5cm voxel cubes coming soon!");
+            // Later: voxel size, chunk info, physics params
+        });
     }
 
     unsafe fn find_memory_type(
