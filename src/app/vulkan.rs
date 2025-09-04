@@ -3,7 +3,7 @@ use std::{ffi::CStr, mem::MaybeUninit, sync::atomic::AtomicBool};
 use anyhow::Context;
 use ash::{khr::surface, vk};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
-use winit::{application::ApplicationHandler, event_loop::EventLoop, window::Window};
+use winit::window::Window;
 
 use crate::Vertex;
 

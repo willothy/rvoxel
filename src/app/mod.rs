@@ -1,9 +1,6 @@
-use std::{mem::MaybeUninit, sync::atomic::AtomicBool};
 
-use ash::{khr::surface, vk};
-use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use vulkan::VulkanApp;
-use winit::{application::ApplicationHandler, event_loop::EventLoop, window::Window};
+use winit::application::ApplicationHandler;
 
 pub mod shaders;
 pub mod vulkan;
