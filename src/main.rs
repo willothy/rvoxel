@@ -66,5 +66,7 @@ async fn main() -> anyhow::Result<()> {
 
     event_loop.run_app(&mut app)?;
 
+    app.cleanup();
+
     Ok(())
 }

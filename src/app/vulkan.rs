@@ -45,6 +45,8 @@ pub struct VulkanAppInner {
     swapchain_format: vk::Format,
     /// The extent (width and height) of the swapchain images.
     swapchain_extent: vk::Extent2D,
+    swapchain_framebuffers: Vec<vk::Framebuffer>,
+    swapchain_image_views: Vec<vk::ImageView>,
 
     command_pool: vk::CommandPool,
     /// Where draw commands are recorded before being submitted to the GPU.
@@ -65,8 +67,6 @@ pub struct VulkanAppInner {
     render_pass: vk::RenderPass,
     graphics_pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
-
-    swapchain_framebuffers: Vec<vk::Framebuffer>,
 }
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
@@ -87,11 +87,23 @@ impl Drop for VulkanApp {
 }
 
 impl Drop for VulkanAppInner {
-    fn drop(&mut self) {
-        // TODO: cleanup more Vulkan resources
+    fn drop(&mut self) {}
+}
+
+impl VulkanApp {
+    pub fn new_uninit() -> Self {
+        Self {
+            app: MaybeUninit::uninit(),
+            initialized: AtomicBool::new(false),
+        }
+    }
+
+    pub unsafe fn cleanup(&self) {
         unsafe {
+            // Wait for all GPU work to finish before destroying anything
             self.device.device_wait_idle().unwrap();
 
+            // Destroy synchronization objects (per-frame objects)
             for i in 0..MAX_FRAMES_IN_FLIGHT {
                 self.device
                     .destroy_semaphore(self.image_available_semaphores[i], None);
@@ -100,20 +112,49 @@ impl Drop for VulkanAppInner {
                 self.device.destroy_fence(self.in_flight_fences[i], None);
             }
 
+            // Destroy command pool (automatically frees command buffers)
+            self.device.destroy_command_pool(self.command_pool, None);
+
+            // Destroy vertex buffer and its memory
+            self.device.destroy_buffer(self.vertex_buffer, None);
+            self.device.free_memory(self.vertex_buffer_memory, None);
+
+            // Destroy graphics pipeline and layout
+            self.device.destroy_pipeline(self.graphics_pipeline, None);
             self.device
-                .destroy_command_pool(self.command_pool.clone(), None);
+                .destroy_pipeline_layout(self.pipeline_layout, None);
 
+            // Destroy framebuffers (one per swapchain image)
+            for &framebuffer in &self.swapchain_framebuffers {
+                self.device.destroy_framebuffer(framebuffer, None);
+            }
+
+            // Destroy image views (one per swapchain image)
+            for &image_view in &self.swapchain_image_views {
+                self.device.destroy_image_view(image_view, None);
+            }
+
+            // Destroy render pass
+            self.device.destroy_render_pass(self.render_pass, None);
+
+            // Destroy shader modules
+            self.device
+                .destroy_shader_module(self.vert_shader_module, None);
+            self.device
+                .destroy_shader_module(self.frag_shader_module, None);
+
+            // Destroy swapchain (note: images are destroyed automatically)
             self.swapchain_loader
-                .destroy_swapchain(self.swapchain.clone(), None);
-        }
-    }
-}
+                .destroy_swapchain(self.swapchain, None);
 
-impl VulkanApp {
-    pub fn new_uninit() -> Self {
-        Self {
-            app: MaybeUninit::uninit(),
-            initialized: AtomicBool::new(false),
+            // Destroy surface
+            self.surface_loader.destroy_surface(self.surface, None);
+
+            // Destroy logical device
+            self.device.destroy_device(None);
+
+            // Destroy instance (last!)
+            self.instance.destroy_instance(None);
         }
     }
 
@@ -185,7 +226,7 @@ impl VulkanApp {
             frag_shader_module,
         )?;
 
-        let swapchain_framebuffers = unsafe {
+        let (swapchain_image_views, swapchain_framebuffers) = unsafe {
             Self::create_framebuffers(
                 &device,
                 &swapchain_images,
@@ -211,6 +252,7 @@ impl VulkanApp {
             swapchain_images,
             swapchain_loader,
             swapchain_framebuffers,
+            swapchain_image_views,
 
             command_pool,
             command_buffers,
@@ -585,7 +627,7 @@ impl VulkanApp {
         render_pass: vk::RenderPass,
         swapchain_extent: vk::Extent2D,
         swapchain_format: vk::Format,
-    ) -> anyhow::Result<Vec<vk::Framebuffer>> {
+    ) -> anyhow::Result<(Vec<vk::ImageView>, Vec<vk::Framebuffer>)> {
         let image_views: Vec<vk::ImageView> = swapchain_images
             .iter()
             .map(|&image| {
@@ -634,7 +676,7 @@ impl VulkanApp {
             })
             .collect::<Result<_, _>>()?;
 
-        Ok(framebuffers)
+        Ok((image_views, framebuffers))
     }
 
     unsafe fn create_surface(
@@ -998,7 +1040,7 @@ impl VulkanApp {
 
         let scissors = [vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
-            extent: extent,
+            extent,
         }];
 
         let viewport_state = vk::PipelineViewportStateCreateInfo::default()

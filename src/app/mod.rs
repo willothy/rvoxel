@@ -1,4 +1,3 @@
-
 use vulkan::VulkanApp;
 use winit::application::ApplicationHandler;
 
@@ -17,6 +16,10 @@ impl App {
             entry: unsafe { ash::Entry::load()? },
             vk: VulkanApp::new_uninit(),
         })
+    }
+
+    pub fn cleanup(&mut self) {
+        unsafe { self.vk.cleanup() };
     }
 
     pub fn intialize(
