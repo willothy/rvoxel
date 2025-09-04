@@ -75,7 +75,7 @@ pub struct VulkanAppInner {
 
     egui_ctx: egui::Context,
     egui_winit: RwLock<egui_winit::State>,
-    egui_renderer: Mutex<egui_ash_renderer::Renderer>,
+    egui_renderer: Mutex<Option<egui_ash_renderer::Renderer>>,
 
     // debug_wireframe: bool,
     debug_fps: f32,
@@ -180,9 +180,11 @@ impl VulkanApp {
             // Destroy surface
             self.surface_loader.destroy_surface(self.surface, None);
 
-            // FIXME: crashes for some reason
-            // // Destroy logical device
-            // self.device.destroy_device(None);
+            // Destroy egui renderer and state
+            drop(self.egui_renderer.lock().unwrap().take());
+
+            // Destroy logical device
+            self.device.destroy_device(None);
 
             // Destroy instance (last!)
             self.instance.destroy_instance(None);
@@ -329,7 +331,7 @@ impl VulkanApp {
             pipeline_layout,
             egui_ctx,
             egui_winit: RwLock::new(egui_winit),
-            egui_renderer: Mutex::new(egui_renderer),
+            egui_renderer: Mutex::new(Some(egui_renderer)),
             debug_fps: 0.,
             debug_frame_time: 0.,
         };
@@ -353,6 +355,8 @@ impl VulkanApp {
     }
 
     pub unsafe fn draw_frame(&mut self, ui: egui::FullOutput) -> anyhow::Result<()> {
+        let start_time = std::time::Instant::now();
+
         unsafe {
             self.device.wait_for_fences(
                 &[self.in_flight_fences[self.current_frame]],
@@ -380,7 +384,11 @@ impl VulkanApp {
         };
 
         // Step 4: Record commands
-        self.record_command_buffer(self.command_buffers[self.current_frame], image_index, ui)?;
+        self.record_command_buffer(
+            self.command_buffers[self.current_frame],
+            image_index,
+            ui.clone(),
+        )?;
 
         // Step 5: Submit commands to GPU
         unsafe { self.submit_commands()? };
@@ -388,8 +396,24 @@ impl VulkanApp {
         // Step 6: Present the result
         unsafe { self.present_image(image_index)? };
 
+        self.egui_renderer
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .free_textures(&ui.textures_delta.free)?;
+
         // Step 7: Move to next frame
         self.current_frame = (self.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
+
+        // Update timing at the end
+        let frame_time = start_time.elapsed().as_secs_f32();
+        self.debug_frame_time = frame_time;
+        self.debug_fps = if frame_time > 0.0 {
+            1.0 / frame_time
+        } else {
+            0.0
+        };
 
         Ok(())
     }
@@ -581,13 +605,13 @@ impl VulkanApp {
 
             let mut renderer = self.egui_renderer.lock().unwrap();
 
-            renderer.set_textures(
+            renderer.as_mut().unwrap().set_textures(
                 self.graphics_queue,
                 self.command_pool,
                 &output.textures_delta.set,
             )?;
 
-            if let Err(e) = renderer.cmd_draw(
+            if let Err(e) = renderer.as_mut().unwrap().cmd_draw(
                 command_buffer,
                 vk::Extent2D {
                     width: self.swapchain_extent.width,
@@ -962,10 +986,6 @@ impl VulkanApp {
             egui_winit.take_egui_input(&self.window)
         };
 
-        // self.egui_ctx.begin_pass(raw_input);
-
-        // self.draw_debug_ui(&self.egui_ctx);
-
         self.egui_ctx.run(raw_input, |ctx| {
             self.draw_debug_ui(ctx);
         })
@@ -981,7 +1001,7 @@ impl VulkanApp {
                 self.debug_frame_time * 1000.0
             ));
 
-            // ui.separator();
+            ui.separator();
 
             ui.heading("Rendering");
             ui.checkbox(&mut true, "Wireframe mode");
