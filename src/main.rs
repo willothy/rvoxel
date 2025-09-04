@@ -42,7 +42,19 @@ pub struct VulkanAppInner {
     swapchain_format: vk::Format,
     /// The extent (width and height) of the swapchain images.
     swapchain_extent: vk::Extent2D,
+
+    command_pool: vk::CommandPool,
+    /// Where draw commands are recorded before being submitted to the GPU.
+    command_buffers: Vec<vk::CommandBuffer>,
+
+    image_available_semaphores: Vec<vk::Semaphore>,
+    render_finished_semaphores: Vec<vk::Semaphore>,
+    in_flight_fences: Vec<vk::Fence>,
+
+    current_frame: usize,
 }
+
+const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
 pub struct VulkanApp {
     app: MaybeUninit<VulkanAppInner>,
@@ -61,7 +73,24 @@ impl Drop for VulkanApp {
 
 impl Drop for VulkanAppInner {
     fn drop(&mut self) {
-        // TODO: cleanup Vulkan resources
+        // TODO: cleanup more Vulkan resources
+        unsafe {
+            self.device.device_wait_idle().unwrap();
+
+            for i in 0..MAX_FRAMES_IN_FLIGHT {
+                self.device
+                    .destroy_semaphore(self.image_available_semaphores[i], None);
+                self.device
+                    .destroy_semaphore(self.render_finished_semaphores[i], None);
+                self.device.destroy_fence(self.in_flight_fences[i], None);
+            }
+
+            self.device
+                .destroy_command_pool(self.command_pool.clone(), None);
+
+            self.swapchain_loader
+                .destroy_swapchain(self.swapchain.clone(), None);
+        }
     }
 }
 
@@ -97,7 +126,7 @@ impl VulkanApp {
 
         let physical_device = unsafe { Self::pick_physical_device(&instance)? };
 
-        let (device, graphics_queue) =
+        let (device, graphics_queue, queue_family) =
             unsafe { Self::create_logical_device(&instance, &physical_device)? };
 
         let (surface, surface_loader) = unsafe { Self::create_surface(entry, &instance, &window)? };
@@ -112,6 +141,13 @@ impl VulkanApp {
                 &window,
             )?
         };
+
+        let command_pool = unsafe { Self::create_command_pool(&device, queue_family)? };
+
+        let command_buffers = unsafe { Self::create_command_buffers(&device, &command_pool)? };
+
+        let (image_available_semaphores, render_finished_semaphores, in_flight_fences) =
+            unsafe { Self::create_sync_objects(&device)? };
 
         let app_inner = VulkanAppInner {
             window,
@@ -128,6 +164,15 @@ impl VulkanApp {
             swapchain_extent: extent,
             swapchain_images: unsafe { swapchain_loader.get_swapchain_images(swapchain)? },
             swapchain_loader,
+
+            command_pool,
+            command_buffers,
+
+            image_available_semaphores,
+            render_finished_semaphores,
+            in_flight_fences,
+
+            current_frame: 0,
         };
 
         self.app = MaybeUninit::new(app_inner);
@@ -146,6 +191,215 @@ impl VulkanApp {
         uninit.initialize(entry, ev)?;
 
         Ok(uninit)
+    }
+
+    pub unsafe fn draw_frame(&mut self) -> anyhow::Result<()> {
+        unsafe {
+            self.device.wait_for_fences(
+                &[self.in_flight_fences[self.current_frame]],
+                true,
+                u64::MAX,
+            )?;
+        }
+
+        // Get next image from swapchain
+        let (image_index, _is_suboptimal) = unsafe {
+            self.swapchain_loader.acquire_next_image(
+                self.swapchain,
+                u64::MAX,
+                // Signal this when ready
+                self.image_available_semaphores[self.current_frame],
+                // Don't use fence here
+                vk::Fence::null(),
+            )?
+        };
+
+        // Reset fence for next time (only after we know we're using this frame)
+        unsafe {
+            self.device
+                .reset_fences(&[self.in_flight_fences[self.current_frame]])?
+        };
+
+        // Step 4: Record commands
+        self.record_command_buffer(self.command_buffers[self.current_frame], image_index)?;
+
+        // Step 5: Submit commands to GPU
+        unsafe { self.submit_commands()? };
+
+        // Step 6: Present the result
+        unsafe { self.present_image(image_index)? };
+
+        // Step 7: Move to next frame
+        self.current_frame = (self.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
+
+        Ok(())
+    }
+
+    unsafe fn submit_commands(&self) -> anyhow::Result<()> {
+        let wait_semaphores = [self.image_available_semaphores[self.current_frame]];
+        let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+        let signal_semaphores = [self.render_finished_semaphores[self.current_frame]];
+        let command_buffers = [self.command_buffers[self.current_frame]];
+
+        let submit_info = vk::SubmitInfo::default()
+            .wait_semaphores(&wait_semaphores) // Don't start until image is available
+            .wait_dst_stage_mask(&wait_stages) // Wait specifically before color output
+            .command_buffers(&command_buffers) // The commands to execute
+            .signal_semaphores(&signal_semaphores); // Signal when rendering is done
+
+        unsafe {
+            self.device.queue_submit(
+                self.graphics_queue,
+                &[submit_info],
+                self.in_flight_fences[self.current_frame], // Signal fence when GPU work is done
+            )?
+        };
+
+        Ok(())
+    }
+
+    unsafe fn present_image(&self, image_index: u32) -> anyhow::Result<()> {
+        let wait_semaphores = [self.render_finished_semaphores[self.current_frame]];
+        let swapchains = [self.swapchain];
+        let image_indices = [image_index];
+
+        let present_info = vk::PresentInfoKHR::default()
+            .wait_semaphores(&wait_semaphores) // Don't present until rendering is done
+            .swapchains(&swapchains) // Which swapchain to present to
+            .image_indices(&image_indices); // Which image in that swapchain
+
+        unsafe {
+            self.swapchain_loader
+                .queue_present(self.graphics_queue, &present_info)?
+        };
+
+        Ok(())
+    }
+
+    unsafe fn transition_image_layout(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        image: vk::Image,
+        old_layout: vk::ImageLayout,
+        new_layout: vk::ImageLayout,
+    ) {
+        // Determine pipeline stages and access masks based on layouts
+        let (src_stage_mask, dst_stage_mask, src_access_mask, dst_access_mask) =
+            match (old_layout, new_layout) {
+                (vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL) => {
+                    // Transitioning from "don't care" to "ready for writing"
+                    (
+                        vk::PipelineStageFlags::TOP_OF_PIPE, // No previous work to wait for
+                        vk::PipelineStageFlags::TRANSFER,    // Transfer operations can start
+                        vk::AccessFlags::empty(),            // No previous access
+                        vk::AccessFlags::TRANSFER_WRITE,     // Will be writing via transfer
+                    )
+                }
+                (vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR) => {
+                    // Transitioning from "ready for writing" to "ready for display"
+                    (
+                        vk::PipelineStageFlags::TRANSFER, // Transfer operations must finish
+                        vk::PipelineStageFlags::BOTTOM_OF_PIPE, // Before any later operations
+                        vk::AccessFlags::TRANSFER_WRITE,  // Was being written to
+                        vk::AccessFlags::empty(),         // No specific access needed for present
+                    )
+                }
+                _ => panic!(
+                    "Unsupported layout transition: {:?} -> {:?}",
+                    old_layout, new_layout
+                ),
+            };
+
+        let barrier = vk::ImageMemoryBarrier::default()
+            .old_layout(old_layout)
+            .new_layout(new_layout)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED) // Not transferring between queues
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR, // Color data (not depth/stencil)
+                base_mip_level: 0,                        // Mipmap level 0 (full resolution)
+                level_count: 1,                           // Just one mip level
+                base_array_layer: 0,                      // Array layer 0 (not array texture)
+                layer_count: 1,                           // Just one layer
+            })
+            .src_access_mask(src_access_mask)
+            .dst_access_mask(dst_access_mask);
+
+        unsafe {
+            self.device.cmd_pipeline_barrier(
+                command_buffer,
+                src_stage_mask,               // Wait for these stages to complete
+                dst_stage_mask,               // Before these stages can start
+                vk::DependencyFlags::empty(), // No special flags
+                &[],                          // No memory barriers
+                &[],                          // No buffer barriers
+                &[barrier],                   // Our image barrier
+            )
+        };
+    }
+
+    fn record_command_buffer(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        image_idx: u32,
+    ) -> anyhow::Result<()> {
+        // Start recording
+        let begin_info = vk::CommandBufferBeginInfo::default();
+        unsafe {
+            self.device
+                .begin_command_buffer(command_buffer, &begin_info)?
+        };
+
+        // For now, just transition image and clear it to blue
+        // (We'll add proper rendering here later)
+        let image = self.swapchain_images[image_idx as usize];
+
+        // Transition image for clearing
+        unsafe {
+            self.transition_image_layout(
+                command_buffer,
+                image,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            )
+        };
+
+        // Clear to blue
+        let clear_color = vk::ClearColorValue {
+            float32: [0.2, 0.8, 0.8, 1.0], // Nice blue
+        };
+
+        unsafe {
+            self.device.cmd_clear_color_image(
+                command_buffer,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &clear_color,
+                &[vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                }],
+            )
+        };
+
+        // Transition for presentation
+        unsafe {
+            self.transition_image_layout(
+                command_buffer,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::PRESENT_SRC_KHR,
+            )
+        };
+
+        // Finish recording
+        unsafe { self.device.end_command_buffer(command_buffer)? };
+
+        Ok(())
     }
 
     unsafe fn create_swap_chain(
@@ -298,7 +552,7 @@ impl VulkanApp {
     unsafe fn create_logical_device(
         instance: &ash::Instance,
         physical_device: &ash::vk::PhysicalDevice,
-    ) -> anyhow::Result<(ash::Device, ash::vk::Queue)> {
+    ) -> anyhow::Result<(ash::Device, ash::vk::Queue, u32)> {
         // TODO: combine this and pick_physical_device to actually find the device that
         // supports the most features we want.
 
@@ -340,7 +594,7 @@ impl VulkanApp {
 
         let graphics_queue = unsafe { device.get_device_queue(graphics_queue_family_index, 0) };
 
-        Ok((device, graphics_queue))
+        Ok((device, graphics_queue, graphics_queue_family_index))
     }
 
     unsafe fn create_instance(
@@ -371,6 +625,55 @@ impl VulkanApp {
             .flags(flags);
 
         Ok(unsafe { entry.create_instance(&create_info, None)? })
+    }
+
+    unsafe fn create_command_pool(
+        device: &ash::Device,
+        graphics_family_index: u32,
+    ) -> anyhow::Result<vk::CommandPool> {
+        let pool_info = vk::CommandPoolCreateInfo::default()
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+            .queue_family_index(graphics_family_index);
+
+        Ok(unsafe { device.create_command_pool(&pool_info, None)? })
+    }
+
+    unsafe fn create_command_buffers(
+        device: &ash::Device,
+        command_pool: &vk::CommandPool,
+    ) -> anyhow::Result<Vec<vk::CommandBuffer>> {
+        let alloc_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(command_pool.clone())
+            .level(vk::CommandBufferLevel::PRIMARY) // Can be submitted directly to queue
+            .command_buffer_count(MAX_FRAMES_IN_FLIGHT as u32);
+
+        unsafe { Ok(device.allocate_command_buffers(&alloc_info)?) }
+    }
+
+    unsafe fn create_sync_objects(
+        device: &ash::Device,
+    ) -> anyhow::Result<(Vec<vk::Semaphore>, Vec<vk::Semaphore>, Vec<vk::Fence>)> {
+        let semaphore_info = vk::SemaphoreCreateInfo::default();
+        // Start signaled so first frame doesn't wait
+        let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+
+        let mut image_available_semaphores = Vec::new();
+        let mut render_finished_semaphores = Vec::new();
+        let mut in_flight_fences = Vec::new();
+
+        for _ in 0..MAX_FRAMES_IN_FLIGHT {
+            unsafe {
+                image_available_semaphores.push(device.create_semaphore(&semaphore_info, None)?);
+                render_finished_semaphores.push(device.create_semaphore(&semaphore_info, None)?);
+                in_flight_fences.push(device.create_fence(&fence_info, None)?);
+            }
+        }
+
+        Ok((
+            image_available_semaphores,
+            render_finished_semaphores,
+            in_flight_fences,
+        ))
     }
 }
 
@@ -427,6 +730,10 @@ impl ApplicationHandler for App {
         if let Err(e) = self.intialize(event_loop) {
             eprintln!("Failed to initialize application: {}", e);
         }
+
+        if let Err(e) = unsafe { self.vk.draw_frame() } {
+            eprintln!("Error: {e}")
+        }
     }
 
     fn window_event(
@@ -445,6 +752,9 @@ impl ApplicationHandler for App {
             }
             winit::event::WindowEvent::RedrawRequested => {
                 self.vk.window.request_redraw();
+                if let Err(e) = unsafe { self.vk.draw_frame() } {
+                    eprintln!("Error: {e}")
+                }
             }
             _ => {}
         }
