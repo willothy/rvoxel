@@ -130,61 +130,62 @@ impl VulkanApp {
 
     pub unsafe fn cleanup(&self) {
         unsafe {
-            // // Wait for all GPU work to finish before destroying anything
-            // self.device.device_wait_idle().unwrap();
-            //
-            // // Destroy synchronization objects (per-frame objects)
-            // for i in 0..MAX_FRAMES_IN_FLIGHT {
-            //     self.device
-            //         .destroy_semaphore(self.image_available_semaphores[i], None);
-            //     self.device
-            //         .destroy_semaphore(self.render_finished_semaphores[i], None);
-            //     self.device.destroy_fence(self.in_flight_fences[i], None);
-            // }
-            //
-            // // Destroy command pool (automatically frees command buffers)
-            // self.device.destroy_command_pool(self.command_pool, None);
-            //
-            // // Destroy vertex buffer and its memory
-            // self.device.destroy_buffer(self.vertex_buffer, None);
-            // self.device.free_memory(self.vertex_buffer_memory, None);
-            //
-            // // Destroy graphics pipeline and layout
-            // self.device.destroy_pipeline(self.graphics_pipeline, None);
-            // self.device
-            //     .destroy_pipeline_layout(self.pipeline_layout, None);
-            //
-            // // Destroy framebuffers (one per swapchain image)
-            // for &framebuffer in &self.swapchain_framebuffers {
-            //     self.device.destroy_framebuffer(framebuffer, None);
-            // }
-            //
-            // // Destroy image views (one per swapchain image)
-            // for &image_view in &self.swapchain_image_views {
-            //     self.device.destroy_image_view(image_view, None);
-            // }
-            //
-            // // Destroy render pass
-            // self.device.destroy_render_pass(self.render_pass, None);
-            //
-            // // Destroy shader modules
-            // self.device
-            //     .destroy_shader_module(self.vert_shader_module, None);
-            // self.device
-            //     .destroy_shader_module(self.frag_shader_module, None);
-            //
-            // // Destroy swapchain (note: images are destroyed automatically)
-            // self.swapchain_loader
-            //     .destroy_swapchain(self.swapchain, None);
-            //
-            // // Destroy surface
-            // self.surface_loader.destroy_surface(self.surface, None);
-            //
+            // Wait for all GPU work to finish before destroying anything
+            self.device.device_wait_idle().unwrap();
+
+            // Destroy synchronization objects (per-frame objects)
+            for i in 0..MAX_FRAMES_IN_FLIGHT {
+                self.device
+                    .destroy_semaphore(self.image_available_semaphores[i], None);
+                self.device
+                    .destroy_semaphore(self.render_finished_semaphores[i], None);
+                self.device.destroy_fence(self.in_flight_fences[i], None);
+            }
+
+            // Destroy command pool (automatically frees command buffers)
+            self.device.destroy_command_pool(self.command_pool, None);
+
+            // Destroy vertex buffer and its memory
+            self.device.destroy_buffer(self.vertex_buffer, None);
+            self.device.free_memory(self.vertex_buffer_memory, None);
+
+            // Destroy graphics pipeline and layout
+            self.device.destroy_pipeline(self.graphics_pipeline, None);
+            self.device
+                .destroy_pipeline_layout(self.pipeline_layout, None);
+
+            // Destroy framebuffers (one per swapchain image)
+            for &framebuffer in &self.swapchain_framebuffers {
+                self.device.destroy_framebuffer(framebuffer, None);
+            }
+
+            // Destroy image views (one per swapchain image)
+            for &image_view in &self.swapchain_image_views {
+                self.device.destroy_image_view(image_view, None);
+            }
+
+            // Destroy render pass
+            self.device.destroy_render_pass(self.render_pass, None);
+
+            // Destroy shader modules
+            self.device
+                .destroy_shader_module(self.vert_shader_module, None);
+            self.device
+                .destroy_shader_module(self.frag_shader_module, None);
+
+            // Destroy swapchain (note: images are destroyed automatically)
+            self.swapchain_loader
+                .destroy_swapchain(self.swapchain, None);
+
+            // Destroy surface
+            self.surface_loader.destroy_surface(self.surface, None);
+
+            // FIXME: crashes for some reason
             // // Destroy logical device
             // self.device.destroy_device(None);
-            //
-            // // Destroy instance (last!)
-            // self.instance.destroy_instance(None);
+
+            // Destroy instance (last!)
+            self.instance.destroy_instance(None);
         }
     }
 
