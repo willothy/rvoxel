@@ -59,7 +59,7 @@ impl ApplicationHandler for App {
             return;
         }
 
-        let (event, _) = self.vk.egui_handle_event(event);
+        let event = self.vk.egui_handle_event(event);
 
         let Some(event) = event else {
             // egui handled the event
@@ -71,13 +71,11 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             }
             winit::event::WindowEvent::RedrawRequested => {
-                self.vk.window.request_redraw();
+                let ui = self.vk.update_ui();
 
-                // let ui = self.vk.update_ui();
-                //
-                // if let Err(e) = unsafe { self.vk.draw_frame(ui) } {
-                //     eprintln!("Error: {e}")
-                // }
+                if let Err(e) = unsafe { self.vk.draw_frame(ui) } {
+                    eprintln!("Error: {e}")
+                }
             }
             _ => {}
         }

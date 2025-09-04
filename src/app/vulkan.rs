@@ -114,14 +114,18 @@ impl VulkanApp {
     pub fn egui_handle_event(
         &self,
         event: winit::event::WindowEvent,
-    ) -> (Option<winit::event::WindowEvent>, egui_winit::EventResponse) {
+    ) -> Option<winit::event::WindowEvent> {
         let res = self
             .egui_winit
             .write()
             .unwrap()
             .on_window_event(&self.window, &event);
 
-        (res.consumed.not().then_some(event), res)
+        if res.repaint {
+            self.window.request_redraw();
+        }
+
+        res.consumed.not().then_some(event)
     }
 
     pub unsafe fn cleanup(&self) {
@@ -979,14 +983,14 @@ impl VulkanApp {
             // ui.separator();
 
             ui.heading("Rendering");
-            // ui.checkbox(&mut self.debug_wireframe, "Wireframe mode");
+            ui.checkbox(&mut true, "Wireframe mode");
 
-            // if ui.button("Reset Camera") {
-            //     // TODO: Reset camera when we add it
-            //     println!("Camera reset!");
-            // }
+            if ui.button("Reset Camera").clicked() {
+                // TODO: Reset camera when we add it
+                println!("Camera reset!");
+            }
 
-            // ui.separator();
+            ui.separator();
 
             ui.heading("Voxels");
             ui.label("5cm voxel cubes coming soon!");
