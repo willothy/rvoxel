@@ -200,29 +200,6 @@ impl VulkanApp {
 
         let swapchain_device = ash::khr::swapchain::Device::new(&instance, &device);
 
-        let info = vk::SwapchainCreateInfoKHR::default()
-            .surface(surface.clone())
-            .min_image_count(image_count)
-            .image_format(surface_format.format)
-            .image_color_space(surface_format.color_space)
-            .image_extent(capabilities.current_extent)
-            // Always 1 unless doing VR
-            .image_array_layers(1)
-            // We'll draw to these
-            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
-            // Only graphics queue uses them
-            .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
-            // No rotation
-            .pre_transform(capabilities.current_transform)
-            // No transparency
-            .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-            .present_mode(present_mode)
-            // Don't care about pixels behind other windows
-            .clipped(true);
-
-        // use ash::extensions::khr::swapchain;
-        let swap_chain = unsafe { swapchain_device.create_swapchain(&info, None)? };
-
         let extent = if capabilities.current_extent.width != u32::MAX {
             // Surface tells us exactly what size to use
             capabilities.current_extent
@@ -241,6 +218,29 @@ impl VulkanApp {
                 ),
             }
         };
+
+        let info = vk::SwapchainCreateInfoKHR::default()
+            .surface(surface.clone())
+            .min_image_count(image_count)
+            .image_format(surface_format.format)
+            .image_color_space(surface_format.color_space)
+            .image_extent(extent)
+            // Always 1 unless doing VR
+            .image_array_layers(1)
+            // We'll draw to these
+            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            // Only graphics queue uses them
+            .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
+            // No rotation
+            .pre_transform(capabilities.current_transform)
+            // No transparency
+            .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+            .present_mode(present_mode)
+            // Don't care about pixels behind other windows
+            .clipped(true);
+
+        // use ash::extensions::khr::swapchain;
+        let swap_chain = unsafe { swapchain_device.create_swapchain(&info, None)? };
 
         Ok((swap_chain, swapchain_device, surface_format, extent))
     }
@@ -321,8 +321,14 @@ impl VulkanApp {
         // .fill_mode_non_solid(true)
         let features = ash::vk::PhysicalDeviceFeatures::default();
 
+        let device_extension_names = [
+            // enables swapchain
+            ash::khr::swapchain::NAME.as_ptr(),
+        ];
+
         let device_create_info = ash::vk::DeviceCreateInfo::default()
             .enabled_features(&features)
+            .enabled_extension_names(&device_extension_names)
             .queue_create_infos(std::slice::from_ref(&queue_create_info));
 
         // Create the device
