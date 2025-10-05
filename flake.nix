@@ -17,6 +17,10 @@
           vulkan-tools
           vulkan-loader
           vulkan-headers
+          vulkan-extension-layer
+          vulkan-caps-viewer
+          vulkan-validation-layers
+          vulkan-utility-llibraries
         ];
       in
       {

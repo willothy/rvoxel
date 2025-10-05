@@ -25,6 +25,39 @@ use crate::{
     renderer::ubo::UniformBufferObject,
 };
 
+unsafe extern "system" fn vulkan_debug_callback(
+    message_severity: vk::DebugUtilsMessageSeverityFlagsEXT,
+    message_type: vk::DebugUtilsMessageTypeFlagsEXT,
+    p_callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT,
+    _user_data: *mut std::ffi::c_void,
+) -> vk::Bool32 {
+    let message = unsafe {
+        let callback_data = *p_callback_data;
+        if callback_data.p_message.is_null() {
+            std::borrow::Cow::from("")
+        } else {
+            std::ffi::CStr::from_ptr(callback_data.p_message).to_string_lossy()
+        }
+    };
+
+    match message_severity {
+        vk::DebugUtilsMessageSeverityFlagsEXT::ERROR => {
+            eprintln!("🔴 VULKAN ERROR [{:?}]: {}", message_type, message);
+        }
+        vk::DebugUtilsMessageSeverityFlagsEXT::WARNING => {
+            eprintln!("🟡 VULKAN WARNING [{:?}]: {}", message_type, message);
+        }
+        vk::DebugUtilsMessageSeverityFlagsEXT::INFO => {
+            println!("🔵 VULKAN INFO [{:?}]: {}", message_type, message);
+        }
+        _ => {
+            println!("⚪ VULKAN [{:?}]: {}", message_type, message);
+        }
+    }
+
+    vk::FALSE
+}
+
 struct RendererInner {
     /// The window that we are rendering to, from [`winit`].
     window: Arc<winit::window::Window>,
@@ -104,6 +137,11 @@ struct RendererInner {
     egui_renderer: Mutex<Option<egui_ash_renderer::Renderer>>,
 
     shutdown: Arc<AtomicBool>,
+
+    #[cfg(debug_assertions)]
+    debug_utils_loader: ash::ext::debug_utils::Instance,
+    #[cfg(debug_assertions)]
+    debug_messenger: vk::DebugUtilsMessengerEXT,
 }
 
 pub struct DebugState {
@@ -450,6 +488,10 @@ impl RendererInner {
             // Destroy logical device
             self.device.destroy_device(None);
 
+            #[cfg(debug_assertions)]
+            self.debug_utils_loader
+                .destroy_debug_utils_messenger(self.debug_messenger, None);
+
             // Destroy instance (last!)
             self.instance.destroy_instance(None);
         }
@@ -479,6 +521,10 @@ impl RendererInner {
         );
 
         let instance = unsafe { Self::create_instance(&entry, &window)? };
+
+        #[cfg(debug_assertions)]
+        let (debug_utils_loader, debug_messenger) =
+            unsafe { Self::setup_debug_messenger(entry, &instance)? };
 
         let physical_device = unsafe { Self::pick_physical_device(&instance)? };
 
@@ -568,6 +614,11 @@ impl RendererInner {
 
         Ok(Self {
             shutdown,
+
+            #[cfg(debug_assertions)]
+            debug_utils_loader,
+            #[cfg(debug_assertions)]
+            debug_messenger,
 
             window: Arc::new(window),
             instance,
@@ -1258,6 +1309,35 @@ impl RendererInner {
         Ok((device, graphics_queue, graphics_queue_family_index))
     }
 
+    #[cfg(debug_assertions)]
+    unsafe fn setup_debug_messenger(
+        entry: &ash::Entry,
+        instance: &ash::Instance,
+    ) -> anyhow::Result<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)> {
+        let debug_utils_loader = ash::ext::debug_utils::Instance::new(entry, instance);
+
+        let debug_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
+            .message_severity(
+                vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
+                    | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
+                    | vk::DebugUtilsMessageSeverityFlagsEXT::INFO,
+            )
+            .message_type(
+                vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
+                    | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
+                    | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
+            )
+            .pfn_user_callback(Some(vulkan_debug_callback));
+
+        let debug_messenger = unsafe {
+            debug_utils_loader
+                .create_debug_utils_messenger(&debug_info, None)
+                .context("Failed to create debug messenger")?
+        };
+
+        Ok((debug_utils_loader, debug_messenger))
+    }
+
     unsafe fn create_instance(
         entry: &ash::Entry,
         window: &Window,
@@ -1272,16 +1352,27 @@ impl RendererInner {
         let mut extension_names =
             ash_window::enumerate_required_extensions(window.display_handle()?.into())?.to_vec();
 
-        extension_names.push(
-            std::ffi::CStr::from_bytes_with_nul(b"VK_KHR_portability_enumeration\0")?.as_ptr(),
-        );
+        extension_names.extend([
+            vk::KHR_PORTABILITY_ENUMERATION_NAME.as_ptr(),
+            #[cfg(debug_assertions)]
+            vk::EXT_DEBUG_UTILS_NAME.as_ptr(),
+            // #[cfg(debug_assertions)]
+            // vk::EXT_VALIDATION_FEATURES_NAME.as_ptr(),
+            // vk::EXT_VALIDATION_FLAGS_NAME.as_ptr(),
+        ]);
 
         let mut flags = ash::vk::InstanceCreateFlags::default();
 
         flags |= ash::vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
 
+        let layer_names = [
+            // #[cfg(debug_assertions)]
+            // ash::ext::validation_features::NAME.as_ptr(),
+        ];
+
         let create_info = ash::vk::InstanceCreateInfo::default()
             .application_info(&app_info)
+            .enabled_layer_names(&layer_names)
             .enabled_extension_names(&extension_names)
             .flags(flags);
 

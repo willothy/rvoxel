@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = { version = "1.0.99", features = ["backtrace"] }
-ash = { version = "0.38.0", features = [] }
+ash = { version = "0.38.0", features = ["debug"] }
 ash-window = "0.13.0"
 bevy_ecs = "0.17.2"
 bytemuck = { version = "1.23.2", features = ["derive"] }
