@@ -7,7 +7,7 @@ use std::{
 use anyhow::Context;
 use ash::{khr::surface, vk};
 use bevy_ecs::prelude::*;
-use glam::Mat4;
+use glam::{Mat4, Vec3};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::Window;
 
@@ -225,12 +225,29 @@ impl VulkanRenderer {
                         tracing::info!("Wireframe mode set to {}", *self.debug.wireframe.read());
                     }
 
+                    ui.separator();
+
+                    ui.heading("Camera");
+
                     if ui.button("Reset Camera").clicked() {
-                        // TODO: Reset camera when we add it
                         tracing::info!("Camera reset!");
                     }
 
-                    ui.separator();
+                    // Calculate forward from the actual rotation quaternion
+                    let forward = camera_transform.rotation * Vec3::NEG_Z; // Rotate local -Z by camera rotation
+
+                    ui.small("Transform");
+
+                    ui.label(format!(
+                        "Position: ({:.2}, {:.2}, {:.2})",
+                        camera_transform.position.x,
+                        camera_transform.position.y,
+                        camera_transform.position.z
+                    ));
+                    ui.label(format!(
+                        "Rotation: ({:.2}, {:.2}, {:.2})",
+                        forward.x, forward.y, forward.z
+                    ));
                 });
         });
 
