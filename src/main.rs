@@ -1,101 +1,12 @@
-use ash::vk;
-use glam::{Mat4, Vec3};
 use winit::event_loop::EventLoop;
 
 pub mod app;
 pub mod renderer;
 
-pub struct Camera {
-    position: Vec3,
-    rotation: Vec3, // Pitch, yaw, roll in radians
-}
-
-impl Camera {
-    fn new() -> Self {
-        Camera {
-            position: Vec3::new(0.1, 0.1, 0.3), // Back away from cube
-            rotation: Vec3::ZERO,
-        }
-    }
-
-    fn get_view_matrix(&self) -> Mat4 {
-        // Simple look-at style view
-        Mat4::look_at_rh(
-            self.position, // Camera position
-            Vec3::ZERO,    // Look at origin (where cube is)
-            Vec3::Y,       // Up direction
-        )
-    }
-
-    fn get_projection_matrix(&self, aspect_ratio: f32) -> Mat4 {
-        // Perspective projection
-        Mat4::perspective_rh(
-            70.0_f32.to_radians(), // FOV (70 degrees)
-            aspect_ratio,          // Aspect ratio
-            0.01,                  // Near plane
-            100.0,                 // Far plane
-        )
-    }
-}
-
-pub struct UniformBufferObject {
-    /// Model transform (object position/rotation)
-    model: glam::Mat4,
-    /// Camera view transform
-    view: glam::Mat4,
-    /// Perspective projection
-    projection: glam::Mat4,
-}
-
-#[repr(C)]
-#[derive(Clone, Debug, Copy, bytemuck::Zeroable, bytemuck::Pod)]
-pub struct Vertex {
-    pos: glam::Vec3,
-    color: glam::Vec3,
-    normal: glam::Vec3,
-}
-
-impl Vertex {
-    // Describes the overall vertex input
-    fn get_binding_description() -> vk::VertexInputBindingDescription {
-        vk::VertexInputBindingDescription::default()
-            .binding(0) // Binding index
-            .stride(std::mem::size_of::<Vertex>() as u32) // Bytes between vertices
-            .input_rate(vk::VertexInputRate::VERTEX) // Per-vertex data (not per-instance)
-    }
-
-    // Describes each field in the vertex
-    fn get_attribute_descriptions() -> [vk::VertexInputAttributeDescription; 3] {
-        [
-            // Position field
-            vk::VertexInputAttributeDescription {
-                binding: 0,                           // Same binding as above
-                location: 0,                          // layout(location = 0) in shader
-                format: vk::Format::R32G32B32_SFLOAT, // 3x 32-bit floats
-                offset: 0,                            // Position is at start of struct
-            },
-            // Color field
-            vk::VertexInputAttributeDescription {
-                binding: 0,
-                location: 1,                          // layout(location = 1) in shader
-                format: vk::Format::R32G32B32_SFLOAT, // 3x 32-bit floats
-                offset: std::mem::size_of::<glam::Vec3>() as u32, // After position field
-            },
-            // Normal field
-            vk::VertexInputAttributeDescription {
-                binding: 0,
-                location: 2,
-                format: vk::Format::R32G32B32_SFLOAT, // 3x 32-bit floats
-                offset: (std::mem::size_of::<glam::Vec3>() * 2) as u32,
-            },
-        ]
-    }
-}
-
 pub mod shapes {
     use glam::Vec3;
 
-    use super::Vertex;
+    use super::renderer::vertex::Vertex;
 
     // A 5cm cube centered at origin
     const CUBE_SIZE: f32 = 0.05; // 5cm in meters

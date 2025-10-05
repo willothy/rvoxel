@@ -11,7 +11,7 @@ use glam::Mat4;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::Window;
 
-use crate::{Camera, UniformBufferObject, Vertex};
+use crate::renderer::{camera::Camera, ubo::UniformBufferObject, vertex::Vertex};
 
 struct RendererInner {
     #[allow(unused)]
@@ -109,7 +109,7 @@ pub struct VulkanRenderer {
     vk: OnceLock<RendererInner>,
 
     debug: DebugState,
-    camera: crate::Camera,
+    camera: Camera,
 }
 
 impl VulkanRenderer {
@@ -965,7 +965,7 @@ impl RendererInner {
             let buffer_info = vk::DescriptorBufferInfo::default()
                 .buffer(uniform_buffers[i])
                 .offset(0)
-                .range(std::mem::size_of::<crate::UniformBufferObject>() as vk::DeviceSize);
+                .range(std::mem::size_of::<UniformBufferObject>() as vk::DeviceSize);
 
             let descriptor_write = vk::WriteDescriptorSet::default()
                 .dst_set(descriptor_sets[i])
@@ -1004,7 +1004,7 @@ impl RendererInner {
         instance: &ash::Instance,
         physical_device: vk::PhysicalDevice,
     ) -> anyhow::Result<(Vec<vk::Buffer>, Vec<vk::DeviceMemory>)> {
-        let buffer_size = std::mem::size_of::<crate::UniformBufferObject>() as vk::DeviceSize;
+        let buffer_size = std::mem::size_of::<UniformBufferObject>() as vk::DeviceSize;
 
         let mut buffers = Vec::new();
         let mut buffers_memory = Vec::new();
@@ -1338,8 +1338,8 @@ impl RendererInner {
         instance: &ash::Instance,
         physical_device: vk::PhysicalDevice,
     ) -> anyhow::Result<(vk::Buffer, vk::DeviceMemory)> {
-        let buffer_size = (std::mem::size_of::<crate::Vertex>()
-            * crate::shapes::CUBE_VERTICES.len()) as vk::DeviceSize;
+        let buffer_size =
+            (std::mem::size_of::<Vertex>() * crate::shapes::CUBE_VERTICES.len()) as vk::DeviceSize;
 
         // Create the buffer object
         let buffer_info = vk::BufferCreateInfo::default()
@@ -1390,7 +1390,7 @@ impl RendererInner {
                     vk::MemoryMapFlags::empty(), // No special flags
                 )
                 .expect("Failed to map vertex buffer memory")
-                as *mut crate::Vertex;
+                as *mut Vertex;
 
             // Copy our vertex data
             std::ptr::copy_nonoverlapping(
