@@ -598,10 +598,10 @@ impl VulkanApp {
 
         // Render egui
         if !clipped_primitives.is_empty() {
-            println!(
-                "Rendering egui with {} clipped primitives",
-                clipped_primitives.len()
-            );
+            // println!(
+            //     "Rendering egui with {} clipped primitives",
+            //     clipped_primitives.len()
+            // );
 
             let mut renderer = self.egui_renderer.lock().unwrap();
 
@@ -621,7 +621,7 @@ impl VulkanApp {
                 &clipped_primitives,
                 // &output.textures_delta,
             ) {
-                println!("Failed to render egui: {}", e);
+                eprintln!("Failed to render egui: {}", e);
             }
         }
 
@@ -1270,7 +1270,7 @@ impl VulkanApp {
                 .context("Failed to create graphics pipeline")?[0]
         };
 
-        println!("✅ Graphics pipeline created");
+        println!("Graphics pipeline created");
 
         Ok((graphics_pipeline, pipeline_layout))
     }
