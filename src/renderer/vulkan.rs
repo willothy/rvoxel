@@ -1,22 +1,27 @@
 use std::{
     ffi::CStr,
     ops::Not,
-    sync::{atomic::AtomicUsize, Mutex, OnceLock},
+    sync::{atomic::AtomicUsize, Arc, Mutex, OnceLock},
 };
 
 use anyhow::Context;
 use ash::{khr::surface, vk};
+use bevy_ecs::prelude::*;
 use egui::mutex::RwLock;
 use glam::Mat4;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::Window;
 
-use crate::renderer::{camera::Camera, ubo::UniformBufferObject, vertex::Vertex};
+use crate::{
+    components::{
+        camera::Camera,
+        mesh::{Mesh, Vertex},
+        transform::Transform,
+    },
+    renderer::ubo::UniformBufferObject,
+};
 
 struct RendererInner {
-    #[allow(unused)]
-    entry: ash::Entry,
-
     /// The window that we are rendering to, from [`winit`].
     window: winit::window::Window,
 
@@ -103,26 +108,25 @@ pub struct DebugState {
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
+#[derive(Resource, Clone)]
 pub struct VulkanRenderer {
     entry: ash::Entry,
 
-    vk: OnceLock<RendererInner>,
+    vk: Arc<OnceLock<RendererInner>>,
 
-    debug: DebugState,
-    camera: Camera,
+    debug: Arc<DebugState>,
 }
 
 impl VulkanRenderer {
     pub fn new(entry: ash::Entry) -> Self {
         Self {
             entry,
-            vk: OnceLock::new(),
-            debug: DebugState {
+            vk: Arc::new(OnceLock::new()),
+            debug: Arc::new(DebugState {
                 fps: RwLock::new(0.),
                 frame_time: RwLock::new(0.),
                 wireframe: RwLock::new(false),
-            },
-            camera: Camera::new(),
+            }),
         }
     }
 
@@ -133,8 +137,15 @@ impl VulkanRenderer {
         self.vk().egui_handle_event(event)
     }
 
-    pub fn draw_frame(&mut self) -> anyhow::Result<()> {
-        let ui = self.vk.get_mut().unwrap().draw_ui(|ctx| {
+    pub fn draw_frame(
+        &self,
+        camera_transform: &Transform,
+        camera: &Camera,
+        meshes: &[(&Mesh, &Transform)],
+    ) -> anyhow::Result<()> {
+        let vk_mut = self.vk.get().unwrap();
+
+        let ui = vk_mut.draw_ui(|ctx| {
             egui::SidePanel::new(egui::panel::Side::Left, egui::Id::new("debug_ui_sidepanel"))
                 .show(ctx, |ui| {
                     ui.heading("Performance");
@@ -164,16 +175,11 @@ impl VulkanRenderer {
                 });
         });
 
-        unsafe {
-            self.vk
-                .get_mut()
-                .expect("not initialized")
-                .draw_frame(ui, &self.debug, &self.camera)
-        }
+        unsafe { vk_mut.draw_frame(ui, &self.debug, camera, camera_transform) }
     }
 
     pub unsafe fn initialize(
-        &mut self,
+        &self,
         event_loop: &winit::event_loop::ActiveEventLoop,
     ) -> anyhow::Result<()> {
         let renderer = RendererInner::new(&self.entry, event_loop)?;
@@ -216,7 +222,7 @@ impl RendererInner {
         res.consumed.not().then_some(event)
     }
 
-    pub fn draw_ui(&mut self, draw: impl FnMut(&egui::Context)) -> egui::FullOutput {
+    pub fn draw_ui(&self, draw: impl FnMut(&egui::Context)) -> egui::FullOutput {
         let raw_input = {
             let mut egui_winit = self.egui_winit.write();
 
@@ -227,10 +233,11 @@ impl RendererInner {
     }
 
     unsafe fn draw_frame(
-        &mut self,
+        &self,
         ui: egui::FullOutput,
         debug: &DebugState,
         camera: &Camera,
+        camera_transform: &Transform,
     ) -> anyhow::Result<()> {
         let start_time = std::time::Instant::now();
 
@@ -259,7 +266,7 @@ impl RendererInner {
                 .reset_fences(&[self.in_flight_fences[current_frame]])?
         };
 
-        unsafe { self.update_uniform_buffer(camera) };
+        unsafe { self.update_uniform_buffer(camera, camera_transform) };
 
         unsafe {
             self.device
@@ -303,13 +310,13 @@ impl RendererInner {
         Ok(())
     }
 
-    unsafe fn update_uniform_buffer(&self, camera: &Camera) {
+    unsafe fn update_uniform_buffer(&self, camera: &Camera, camera_transform: &Transform) {
         // Calculate matrices
         let model = Mat4::IDENTITY; // No transformation for now (cube at origin)
 
         let aspect_ratio = self.swapchain_extent.width as f32 / self.swapchain_extent.height as f32;
-        let view = camera.get_view_matrix();
-        let projection = camera.get_projection_matrix(aspect_ratio);
+        let view = camera.view_matrix(camera_transform);
+        let projection = camera.projection_matrix(aspect_ratio);
 
         let ubo = UniformBufferObject {
             model,
@@ -529,8 +536,6 @@ impl RendererInner {
         )?;
 
         Ok(Self {
-            entry: entry.clone(),
-
             window,
             instance,
             physical_device,

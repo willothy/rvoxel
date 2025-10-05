@@ -1,12 +1,26 @@
 use bevy_ecs::prelude::*;
 use glam::{Mat4, Quat, Vec3};
 
+use crate::components::transform::Transform;
+
 // Camera component
-#[derive(Component)]
+#[derive(Debug, Clone, Component)]
 pub struct Camera {
     pub fov: f32,
     pub near: f32,
     pub far: f32,
+}
+
+impl Camera {
+    pub fn view_matrix(&self, transform: &Transform) -> Mat4 {
+        let rotation_matrix = Mat4::from_quat(transform.rotation);
+        let translation_matrix = Mat4::from_translation(-transform.position);
+        rotation_matrix * translation_matrix
+    }
+
+    pub fn projection_matrix(&self, aspect_ratio: f32) -> Mat4 {
+        Mat4::perspective_rh_gl(self.fov, aspect_ratio, self.near, self.far)
+    }
 }
 
 impl Default for Camera {

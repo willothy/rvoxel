@@ -9,7 +9,7 @@ pub mod systems;
 pub mod shapes {
     use glam::Vec3;
 
-    use super::renderer::vertex::Vertex;
+    use crate::components::mesh::Vertex;
 
     // A 5cm cube centered at origin
     const CUBE_SIZE: f32 = 0.05; // 5cm in meters
