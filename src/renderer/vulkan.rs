@@ -133,7 +133,37 @@ impl VulkanRenderer {
         self.vk().egui_handle_event(event)
     }
 
-    pub fn draw_frame(&mut self, ui: egui::FullOutput) -> anyhow::Result<()> {
+    pub fn draw_frame(&mut self) -> anyhow::Result<()> {
+        let ui = self.vk.get_mut().unwrap().draw_ui(|ctx| {
+            egui::SidePanel::new(egui::panel::Side::Left, egui::Id::new("debug_ui_sidepanel"))
+                .show(ctx, |ui| {
+                    ui.heading("Performance");
+                    ui.label(format!("FPS: {:.1}", *self.debug.fps.read()));
+                    ui.label(format!(
+                        "Frame time: {:.3}ms",
+                        *self.debug.frame_time.read() * 1000.0
+                    ));
+
+                    ui.separator();
+
+                    ui.heading("Rendering");
+
+                    if ui
+                        .checkbox(&mut *self.debug.wireframe.write(), "Wireframe")
+                        .changed()
+                    {
+                        tracing::info!("Wireframe mode set to {}", *self.debug.wireframe.read());
+                    }
+
+                    if ui.button("Reset Camera").clicked() {
+                        // TODO: Reset camera when we add it
+                        tracing::info!("Camera reset!");
+                    }
+
+                    ui.separator();
+                });
+        });
+
         unsafe {
             self.vk
                 .get_mut()
@@ -158,48 +188,6 @@ impl VulkanRenderer {
 
     fn vk(&self) -> &RendererInner {
         self.vk.get().expect("VulkanRenderer not initialized")
-    }
-
-    pub fn update_ui(&mut self) -> egui::FullOutput {
-        let raw_input = {
-            let mut egui_winit = self.vk().egui_winit.write();
-
-            egui_winit.take_egui_input(&self.vk().window)
-        };
-
-        self.vk().egui_ctx.run(raw_input, |ctx| {
-            self.draw_debug_ui(ctx);
-        })
-    }
-
-    fn draw_debug_ui(&self, ctx: &egui::Context) {
-        // egui::TopBottomPanel::bottom(egui::Id::new("debug_ui"))
-        egui::SidePanel::new(egui::panel::Side::Left, egui::Id::new("debug_ui")).show(ctx, |ui| {
-            ui.heading("Performance");
-            ui.label(format!("FPS: {:.1}", *self.debug.fps.read()));
-            ui.label(format!(
-                "Frame time: {:.3}ms",
-                *self.debug.frame_time.read() * 1000.0
-            ));
-
-            ui.separator();
-
-            ui.heading("Rendering");
-
-            if ui
-                .checkbox(&mut *self.debug.wireframe.write(), "Wireframe")
-                .changed()
-            {
-                tracing::info!("Wireframe mode set to {}", *self.debug.wireframe.read());
-            }
-
-            if ui.button("Reset Camera").clicked() {
-                // TODO: Reset camera when we add it
-                tracing::info!("Camera reset!");
-            }
-
-            ui.separator();
-        });
     }
 }
 
@@ -226,6 +214,16 @@ impl RendererInner {
         }
 
         res.consumed.not().then_some(event)
+    }
+
+    pub fn draw_ui(&mut self, draw: impl FnMut(&egui::Context)) -> egui::FullOutput {
+        let raw_input = {
+            let mut egui_winit = self.egui_winit.write();
+
+            egui_winit.take_egui_input(&self.window)
+        };
+
+        self.egui_ctx.run(raw_input, draw)
     }
 
     unsafe fn draw_frame(

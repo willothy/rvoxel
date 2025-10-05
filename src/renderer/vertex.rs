@@ -1,5 +1,4 @@
 use ash::vk;
-use glam::{Mat4, Vec3};
 
 #[repr(C)]
 #[derive(Clone, Debug, Copy, bytemuck::Zeroable, bytemuck::Pod)]

@@ -35,9 +35,7 @@ impl ApplicationHandler for App {
             }
         }
 
-        let ui = self.vk.update_ui();
-
-        if let Err(e) = self.vk.draw_frame(ui) {
+        if let Err(e) = self.vk.draw_frame() {
             tracing::error!("Error: {e}")
         }
     }
@@ -58,9 +56,7 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             }
             winit::event::WindowEvent::RedrawRequested => {
-                let ui = self.vk.update_ui();
-
-                if let Err(e) = self.vk.draw_frame(ui) {
+                if let Err(e) = self.vk.draw_frame() {
                     tracing::error!("Error: {e}")
                 }
             }
