@@ -1,5 +1,3 @@
-use std::sync::{atomic::AtomicBool, Arc};
-
 use bevy_ecs::{intern::Interned, prelude::*, query::QuerySingleError, schedule::ScheduleLabel};
 use winit::{
     application::ApplicationHandler,
@@ -123,12 +121,17 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn exiting(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+    fn exiting(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
+        // We need to clean up the Vulkan resources before the winit window is destroyed,
+        // because the Vulkan resources need the window handle.
         unsafe { self.renderer().cleanup_vulkan() };
     }
 
-    fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+    fn about_to_wait(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
         self.world.run_schedule(self.schedule);
+
+        // self.world.run_schedule(self.schedule);
+        self.world.resource_mut::<InputState>().reset_frame();
     }
 
     fn device_event(
@@ -171,8 +174,6 @@ impl ApplicationHandler for App {
                 };
 
                 self.world.resource_mut::<Time>().update();
-
-                // self.world.run_schedule(self.schedule);
 
                 if let Err(e) = self.renderer().draw_frame(
                     &cam_transform,

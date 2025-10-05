@@ -1,10 +1,7 @@
 use std::{
     ffi::CStr,
     ops::Not,
-    sync::{
-        atomic::{AtomicBool, AtomicUsize},
-        Arc, OnceLock,
-    },
+    sync::{atomic::AtomicUsize, Arc, OnceLock},
 };
 
 use anyhow::Context;
@@ -22,7 +19,7 @@ use crate::{
         mesh::{Mesh, Vertex},
         transform::Transform,
     },
-    renderer::ubo::UniformBufferObject,
+    renderer::uniforms::UniformBufferObject,
 };
 
 unsafe extern "system" fn vulkan_debug_callback(
@@ -113,13 +110,13 @@ struct RendererInner {
     images_in_flight: Vec<RwLock<vk::Fence>>,
     current_frame: AtomicUsize,
 
-    vertex_buffer: vk::Buffer,
-    /// Actual GPU memory allocation for the vertex buffer.
-    vertex_buffer_memory: vk::DeviceMemory,
-
-    index_buffer: vk::Buffer,
-    index_buffer_memory: vk::DeviceMemory,
-
+    // NOTE: old
+    // vertex_buffer: vk::Buffer,
+    // /// Actual GPU memory allocation for the vertex buffer.
+    // vertex_buffer_memory: vk::DeviceMemory,
+    //
+    // index_buffer: vk::Buffer,
+    // index_buffer_memory: vk::DeviceMemory,
     uniform_buffers: Vec<vk::Buffer>,
     uniform_buffers_memory: Vec<vk::DeviceMemory>,
 
@@ -137,6 +134,12 @@ struct RendererInner {
     egui_ctx: egui::Context,
     egui_winit: Mutex<egui_winit::State>,
     egui_renderer: Mutex<Option<egui_ash_renderer::Renderer>>,
+
+    // Shared mesh data
+    cube_vertex_buffer: vk::Buffer,
+    cube_vertex_buffer_memory: vk::DeviceMemory,
+    cube_index_buffer: vk::Buffer,
+    cube_index_buffer_memory: vk::DeviceMemory,
 
     #[cfg(debug_assertions)]
     debug_utils_loader: ash::ext::debug_utils::Instance,
@@ -231,7 +234,7 @@ impl VulkanRenderer {
                 });
         });
 
-        unsafe { vk.draw_frame(ui, &self.debug, camera, camera_transform) }
+        unsafe { vk.draw_frame(ui, &self.debug, camera, camera_transform, meshes) }
     }
 
     pub unsafe fn initialize(
@@ -289,6 +292,7 @@ impl RendererInner {
         debug: &DebugState,
         camera: &Camera,
         camera_transform: &Transform,
+        meshes: &[(&Mesh, &Transform)],
     ) -> anyhow::Result<()> {
         let start_time = std::time::Instant::now();
 
@@ -350,7 +354,12 @@ impl RendererInner {
         };
 
         // Step 4: Record commands
-        self.record_command_buffer(self.command_buffers[current_frame], image_index, ui.clone())?;
+        self.record_command_buffer(
+            self.command_buffers[current_frame],
+            image_index,
+            ui.clone(),
+            meshes,
+        )?;
 
         // Step 5: Submit commands to GPU
         unsafe { self.submit_commands(image_index)? };
@@ -386,18 +395,12 @@ impl RendererInner {
     }
 
     unsafe fn update_uniform_buffer(&self, camera: &Camera, camera_transform: &Transform) {
-        // Calculate matrices
-        let model = Mat4::IDENTITY; // No transformation for now (cube at origin)
-
         let aspect_ratio = self.swapchain_extent.width as f32 / self.swapchain_extent.height as f32;
-        let view = camera.view_matrix(camera_transform);
-        let projection = camera.projection_matrix(aspect_ratio);
 
-        let ubo = UniformBufferObject {
-            model,
-            view,
-            projection,
-        };
+        let view = camera_transform.matrix().inverse();
+        let projection = Mat4::perspective_rh(camera.fov, aspect_ratio, camera.near, camera.far);
+
+        let ubo = UniformBufferObject { view, projection };
 
         let current_image = self.current_frame.load(std::sync::atomic::Ordering::SeqCst);
 
@@ -443,12 +446,13 @@ impl RendererInner {
             // Destroy command pool (automatically frees command buffers)
             self.device.destroy_command_pool(self.command_pool, None);
 
-            // Destroy vertex buffer and its memory
-            self.device.destroy_buffer(self.vertex_buffer, None);
-            self.device.free_memory(self.vertex_buffer_memory, None);
+            // Destroy cube shared buffers and memory
+            self.device.destroy_buffer(self.cube_vertex_buffer, None);
+            self.device
+                .free_memory(self.cube_vertex_buffer_memory, None);
 
-            self.device.destroy_buffer(self.index_buffer, None);
-            self.device.free_memory(self.index_buffer_memory, None);
+            self.device.destroy_buffer(self.cube_index_buffer, None);
+            self.device.free_memory(self.cube_index_buffer_memory, None);
 
             // Cleaning up descriptor pool automatically frees descriptor sets
             self.device
@@ -566,10 +570,10 @@ impl RendererInner {
             images_in_flight,
         ) = unsafe { Self::create_sync_objects(&device, swapchain_images.len())? };
 
-        let (vertex_buffer, vertex_buffer_memory) =
+        let (cube_vertex_buffer, cube_vertex_buffer_memory) =
             Self::create_vertex_buffer(&device, &instance, physical_device)?;
 
-        let (index_buffer, index_buffer_memory) =
+        let (cube_index_buffer, cube_index_buffer_memory) =
             unsafe { Self::create_index_buffer(&device, &instance, physical_device)? };
 
         let descriptor_set_layout = unsafe { Self::create_descriptor_set_layout(&device) };
@@ -659,11 +663,16 @@ impl RendererInner {
 
             current_frame: 0.into(),
 
-            vertex_buffer,
-            vertex_buffer_memory,
+            // vertex_buffer,
+            // vertex_buffer_memory,
+            //
+            // index_buffer,
+            // index_buffer_memory,
+            cube_vertex_buffer,
+            cube_vertex_buffer_memory,
 
-            index_buffer,
-            index_buffer_memory,
+            cube_index_buffer,
+            cube_index_buffer_memory,
 
             uniform_buffers,
             uniform_buffers_memory,
@@ -731,6 +740,7 @@ impl RendererInner {
         command_buffer: vk::CommandBuffer,
         image_idx: u32,
         ui: egui::FullOutput,
+        meshes: &[(&Mesh, &Transform)],
     ) -> anyhow::Result<()> {
         let current_frame = self.current_frame.load(std::sync::atomic::Ordering::SeqCst);
 
@@ -775,17 +785,15 @@ impl RendererInner {
         };
 
         // Bind vertex buffer
-        let vertex_buffers = [self.vertex_buffer];
+        let vertex_buffers = [self.cube_vertex_buffer];
         let offsets = [0];
         unsafe {
             self.device
-                .cmd_bind_vertex_buffers(command_buffer, 0, &vertex_buffers, &offsets)
-        };
+                .cmd_bind_vertex_buffers(command_buffer, 0, &vertex_buffers, &offsets);
 
-        unsafe {
             self.device.cmd_bind_index_buffer(
                 command_buffer,
-                self.index_buffer,
+                self.cube_index_buffer,
                 0,
                 vk::IndexType::UINT16,
             );
@@ -799,18 +807,27 @@ impl RendererInner {
                 &[],
             );
 
-            self.device.cmd_draw_indexed(
-                command_buffer,
-                crate::shapes::CUBE_INDICES.len() as u32,
-                1,
-                0,
-                0,
-                0,
-            );
-        }
+            for (_mesh, transform) in meshes {
+                let model = [transform.matrix()];
 
-        // UI
-        // In record_command_buffer, after your triangle rendering but before cmd_end_render_pass:
+                self.device.cmd_push_constants(
+                    command_buffer,
+                    self.pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX,
+                    0,
+                    bytemuck::cast_slice(&model),
+                );
+
+                self.device.cmd_draw_indexed(
+                    command_buffer,
+                    crate::shapes::CUBE_INDICES.len() as u32,
+                    1,
+                    0,
+                    0,
+                    0,
+                );
+            }
+        }
 
         // Get egui render data
         let output = ui;
@@ -1688,11 +1705,17 @@ impl RendererInner {
 
         // 8. Pipeline layout - uniforms and push constants (none for now)
         let pipeline_layout = unsafe {
+            let push_constant_range = vk::PushConstantRange::default()
+                .stage_flags(vk::ShaderStageFlags::VERTEX)
+                .offset(0)
+                .size(std::mem::size_of::<Mat4>() as u32);
+
             let set_layouts = [descriptor_set_layout];
+            let push_constant_ranges = [push_constant_range];
 
             let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
-                .set_layouts(&set_layouts) // No descriptor sets
-                .push_constant_ranges(&[]); // No push constants
+                .set_layouts(&set_layouts)
+                .push_constant_ranges(&push_constant_ranges);
 
             device
                 .create_pipeline_layout(&pipeline_layout_info, None)
