@@ -2,7 +2,7 @@ use std::{
     ffi::CStr,
     mem::MaybeUninit,
     ops::Not,
-    sync::{atomic::AtomicBool, Arc, Mutex, RwLock},
+    sync::{atomic::AtomicBool, Mutex, RwLock},
 };
 
 use anyhow::Context;
@@ -23,6 +23,7 @@ pub struct VulkanAppInner {
 
     /// Physical device represents a GPU in the system that we have
     /// selected.
+    #[allow(unused)]
     physical_device: ash::vk::PhysicalDevice,
 
     /// The logical device is our connection to the physical device.
@@ -45,8 +46,10 @@ pub struct VulkanAppInner {
     swapchain: vk::SwapchainKHR,
     swapchain_loader: ash::khr::swapchain::Device,
     /// The swapchain images.
+    #[allow(unused)]
     swapchain_images: Vec<vk::Image>,
     /// The format of the images in the swapchain.
+    #[allow(unused)]
     swapchain_format: vk::Format,
     /// The extent (width and height) of the swapchain images.
     swapchain_extent: vk::Extent2D,
@@ -457,69 +460,6 @@ impl VulkanApp {
         };
 
         Ok(())
-    }
-
-    unsafe fn transition_image_layout(
-        &self,
-        command_buffer: vk::CommandBuffer,
-        image: vk::Image,
-        old_layout: vk::ImageLayout,
-        new_layout: vk::ImageLayout,
-    ) {
-        // Determine pipeline stages and access masks based on layouts
-        let (src_stage_mask, dst_stage_mask, src_access_mask, dst_access_mask) =
-            match (old_layout, new_layout) {
-                (vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL) => {
-                    // Transitioning from "don't care" to "ready for writing"
-                    (
-                        vk::PipelineStageFlags::TOP_OF_PIPE, // No previous work to wait for
-                        vk::PipelineStageFlags::TRANSFER,    // Transfer operations can start
-                        vk::AccessFlags::empty(),            // No previous access
-                        vk::AccessFlags::TRANSFER_WRITE,     // Will be writing via transfer
-                    )
-                }
-                (vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR) => {
-                    // Transitioning from "ready for writing" to "ready for display"
-                    (
-                        vk::PipelineStageFlags::TRANSFER, // Transfer operations must finish
-                        vk::PipelineStageFlags::BOTTOM_OF_PIPE, // Before any later operations
-                        vk::AccessFlags::TRANSFER_WRITE,  // Was being written to
-                        vk::AccessFlags::empty(),         // No specific access needed for present
-                    )
-                }
-                _ => panic!(
-                    "Unsupported layout transition: {:?} -> {:?}",
-                    old_layout, new_layout
-                ),
-            };
-
-        let barrier = vk::ImageMemoryBarrier::default()
-            .old_layout(old_layout)
-            .new_layout(new_layout)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED) // Not transferring between queues
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(image)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR, // Color data (not depth/stencil)
-                base_mip_level: 0,                        // Mipmap level 0 (full resolution)
-                level_count: 1,                           // Just one mip level
-                base_array_layer: 0,                      // Array layer 0 (not array texture)
-                layer_count: 1,                           // Just one layer
-            })
-            .src_access_mask(src_access_mask)
-            .dst_access_mask(dst_access_mask);
-
-        unsafe {
-            self.device.cmd_pipeline_barrier(
-                command_buffer,
-                src_stage_mask,               // Wait for these stages to complete
-                dst_stage_mask,               // Before these stages can start
-                vk::DependencyFlags::empty(), // No special flags
-                &[],                          // No memory barriers
-                &[],                          // No buffer barriers
-                &[barrier],                   // Our image barrier
-            )
-        };
     }
 
     fn record_command_buffer(
