@@ -137,6 +137,10 @@ impl VulkanRenderer {
         self.vk().egui_handle_event(event)
     }
 
+    pub fn handle_egui_mouse_motion(&self, event: &winit::event::DeviceEvent) {
+        self.vk().egui_handle_mouse_motion(event);
+    }
+
     pub fn draw_frame(
         &self,
         camera_transform: &Transform,
@@ -220,6 +224,12 @@ impl RendererInner {
         }
 
         res.consumed.not().then_some(event)
+    }
+
+    pub fn egui_handle_mouse_motion(&self, event: &winit::event::DeviceEvent) {
+        if let winit::event::DeviceEvent::MouseMotion { delta } = event {
+            self.egui_winit.write().on_mouse_motion((delta.0, delta.1));
+        }
     }
 
     pub fn draw_ui(&self, draw: impl FnMut(&egui::Context)) -> egui::FullOutput {

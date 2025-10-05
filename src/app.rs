@@ -120,19 +120,24 @@ impl ApplicationHandler for App {
         }
     }
 
-    // fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
-    //     // self.world.run_schedule(self.schedule);
-    // }
-    //
-    // fn device_event(
-    //     &mut self,
-    //     event_loop: &winit::event_loop::ActiveEventLoop,
-    //     device_id: winit::event::DeviceId,
-    //     event: winit::event::DeviceEvent,
-    // ) {
-    //
-    //     //
-    // }
+    fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        self.world.run_schedule(self.schedule);
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &winit::event_loop::ActiveEventLoop,
+        _device_id: winit::event::DeviceId,
+        event: winit::event::DeviceEvent,
+    ) {
+        if let winit::event::DeviceEvent::MouseMotion { delta } = event {
+            self.renderer().handle_egui_mouse_motion(&event);
+            let mut input = self.world.resource_mut::<InputState>();
+            // if input.cursor_locked {
+            input.mouse_delta = (delta.0 as f32, delta.1 as f32);
+            // }
+        }
+    }
 
     fn window_event(
         &mut self,
@@ -159,6 +164,8 @@ impl ApplicationHandler for App {
                 };
 
                 self.world.resource_mut::<Time>().update();
+
+                // self.world.run_schedule(self.schedule);
 
                 if let Err(e) = self.renderer().draw_frame(
                     &cam_transform,
