@@ -7,6 +7,7 @@ use std::{
 use anyhow::Context;
 use ash::{khr::surface, vk};
 use bevy_ecs::prelude::*;
+use egui::LayerId;
 use glam::{Mat4, Vec3};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::Window;
@@ -192,8 +193,19 @@ impl VulkanRenderer {
         self.vk().egui_handle_event(event)
     }
 
-    pub fn handle_egui_mouse_motion(&self, event: &winit::event::DeviceEvent) {
-        self.vk().egui_handle_mouse_motion(event);
+    pub fn handle_mouse_motion_diff(&self, pos: (f64, f64)) {
+        let Some(cur) = self.vk().egui_ctx.pointer_interact_pos() else {
+            return;
+        };
+
+        let dx = cur.x as f64 - pos.0;
+        let dy = cur.y as f64 - pos.1;
+
+        self.handle_egui_mouse_motion((dx, dy));
+    }
+
+    pub fn handle_egui_mouse_motion(&self, delta: (f64, f64)) {
+        self.vk().egui_handle_mouse_motion(delta);
     }
 
     pub fn draw_frame(
@@ -287,10 +299,8 @@ impl RendererInner {
         res.consumed.not().then_some(event)
     }
 
-    pub fn egui_handle_mouse_motion(&self, event: &winit::event::DeviceEvent) {
-        if let winit::event::DeviceEvent::MouseMotion { delta } = event {
-            self.egui_winit.lock().on_mouse_motion((delta.0, delta.1));
-        }
+    pub fn egui_handle_mouse_motion(&self, delta: (f64, f64)) {
+        self.egui_winit.lock().on_mouse_motion((delta.0, delta.1));
     }
 
     pub fn draw_ui(&self, draw: impl FnMut(&egui::Context)) -> egui::FullOutput {

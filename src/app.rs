@@ -141,7 +141,7 @@ impl ApplicationHandler for App {
         event: winit::event::DeviceEvent,
     ) {
         if let winit::event::DeviceEvent::MouseMotion { delta } = event {
-            self.renderer().handle_egui_mouse_motion(&event);
+            self.renderer().handle_egui_mouse_motion(delta);
             let mut input = self.world.resource_mut::<InputState>();
             if input.cursor_locked {
                 input.mouse_delta = (delta.0 as f32, delta.1 as f32);
@@ -210,6 +210,13 @@ impl ApplicationHandler for App {
                         lock_cursor(&mut self.world);
                     }
                 }
+            }
+            WindowEvent::CursorMoved {
+                device_id,
+                position,
+            } => {
+                self.renderer()
+                    .handle_mouse_motion_diff((position.x, position.y));
             }
             _ => {}
         }
