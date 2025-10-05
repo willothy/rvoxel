@@ -31,14 +31,14 @@ impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         unsafe {
             if let Err(e) = self.intialize(event_loop) {
-                eprintln!("Failed to initialize application: {}", e);
+                tracing::error!("Failed to initialize application: {}", e);
             }
         }
 
         let ui = self.vk.update_ui();
 
         if let Err(e) = self.vk.draw_frame(ui) {
-            eprintln!("Error: {e}")
+            tracing::error!("Error: {e}")
         }
     }
 
@@ -61,7 +61,7 @@ impl ApplicationHandler for App {
                 let ui = self.vk.update_ui();
 
                 if let Err(e) = self.vk.draw_frame(ui) {
-                    eprintln!("Error: {e}")
+                    tracing::error!("Error: {e}")
                 }
             }
             _ => {}

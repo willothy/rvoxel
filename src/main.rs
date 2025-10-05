@@ -170,6 +170,8 @@ pub mod shapes {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt::init();
+
     let event_loop = EventLoop::new()?;
 
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);

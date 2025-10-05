@@ -19,7 +19,7 @@ fn compile_shader(
         compiler.compile_into_spirv(source, shader_kind, file_name, "main", Some(&options))?;
 
     if binary_result.get_num_warnings() > 0 {
-        eprintln!(
+        tracing::error!(
             "Shader compilation warnings: {}",
             binary_result.get_warning_messages()
         );

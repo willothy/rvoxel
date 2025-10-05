@@ -190,12 +190,12 @@ impl VulkanRenderer {
                 .checkbox(&mut *self.debug.wireframe.write(), "Wireframe")
                 .changed()
             {
-                println!("Wireframe mode set to {}", *self.debug.wireframe.read());
+                tracing::info!("Wireframe mode set to {}", *self.debug.wireframe.read());
             }
 
             if ui.button("Reset Camera").clicked() {
                 // TODO: Reset camera when we add it
-                println!("Camera reset!");
+                tracing::info!("Camera reset!");
             }
 
             ui.separator();
@@ -721,7 +721,7 @@ impl RendererInner {
 
         // Render egui
         if !clipped_primitives.is_empty() {
-            // println!(
+            // tracing::info!(
             //     "Rendering egui with {} clipped primitives",
             //     clipped_primitives.len()
             // );
@@ -744,7 +744,7 @@ impl RendererInner {
                 &clipped_primitives,
                 // &output.textures_delta,
             ) {
-                eprintln!("Failed to render egui: {}", e);
+                tracing::error!("Failed to render egui: {}", e);
             }
         }
 
@@ -977,7 +977,7 @@ impl RendererInner {
             unsafe { device.update_descriptor_sets(&[descriptor_write], &[]) };
         }
 
-        println!("Descriptor sets created");
+        tracing::info!("Descriptor sets created");
 
         Ok(descriptor_sets)
     }
@@ -1051,7 +1051,7 @@ impl RendererInner {
             buffers_memory.push(buffer_memory);
         }
 
-        println!("Uniform buffers created");
+        tracing::info!("Uniform buffers created");
 
         Ok((buffers, buffers_memory))
     }
@@ -1120,7 +1120,7 @@ impl RendererInner {
 
         unsafe { device.unmap_memory(buffer_memory) };
 
-        println!(
+        tracing::info!(
             "Index buffer created with {} indices",
             crate::shapes::CUBE_INDICES.len()
         );
@@ -1559,7 +1559,7 @@ impl RendererInner {
                 .context("Failed to create graphics pipeline")?[0]
         };
 
-        println!("Graphics pipeline created");
+        tracing::info!("Graphics pipeline created");
 
         Ok((graphics_pipeline, pipeline_layout))
     }
