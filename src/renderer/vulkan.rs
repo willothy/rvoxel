@@ -1,8 +1,7 @@
 use std::{
     ffi::CStr,
-    mem::MaybeUninit,
     ops::Not,
-    sync::{atomic::AtomicBool, Mutex},
+    sync::{atomic::AtomicUsize, Mutex, OnceLock},
 };
 
 use anyhow::Context;
@@ -14,9 +13,12 @@ use winit::window::Window;
 
 use crate::{Camera, UniformBufferObject, Vertex};
 
-pub struct VulkanAppInner {
+struct RendererInner {
+    #[allow(unused)]
+    entry: ash::Entry,
+
     /// The window that we are rendering to, from [`winit`].
-    pub window: winit::window::Window,
+    window: winit::window::Window,
 
     /// The Vulkan instance.
     ///
@@ -65,7 +67,7 @@ pub struct VulkanAppInner {
     image_available_semaphores: Vec<vk::Semaphore>,
     render_finished_semaphores: Vec<vk::Semaphore>,
     in_flight_fences: Vec<vk::Fence>,
-    current_frame: usize,
+    current_frame: AtomicUsize,
 
     vertex_buffer: vk::Buffer,
     /// Actual GPU memory allocation for the vertex buffer.
@@ -101,32 +103,20 @@ pub struct DebugState {
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
-pub struct VulkanApp {
-    app: MaybeUninit<VulkanAppInner>,
-    initialized: AtomicBool,
+pub struct VulkanRenderer {
+    entry: ash::Entry,
+
+    vk: OnceLock<RendererInner>,
+
     debug: DebugState,
     camera: crate::Camera,
 }
 
-impl Drop for VulkanApp {
-    fn drop(&mut self) {
-        if self.is_initialized() {
-            unsafe {
-                std::ptr::drop_in_place(self.app.as_mut_ptr());
-            }
-        }
-    }
-}
-
-impl Drop for VulkanAppInner {
-    fn drop(&mut self) {}
-}
-
-impl VulkanApp {
-    pub fn new_uninit() -> Self {
+impl VulkanRenderer {
+    pub fn new(entry: ash::Entry) -> Self {
         Self {
-            app: MaybeUninit::uninit(),
-            initialized: AtomicBool::new(false),
+            entry,
+            vk: OnceLock::new(),
             debug: DebugState {
                 fps: RwLock::new(0.),
                 frame_time: RwLock::new(0.),
@@ -136,6 +126,92 @@ impl VulkanApp {
         }
     }
 
+    pub fn handle_egui_event(
+        &self,
+        event: winit::event::WindowEvent,
+    ) -> Option<winit::event::WindowEvent> {
+        self.vk().egui_handle_event(event)
+    }
+
+    pub fn draw_frame(&mut self, ui: egui::FullOutput) -> anyhow::Result<()> {
+        unsafe {
+            self.vk
+                .get_mut()
+                .expect("not initialized")
+                .draw_frame(ui, &self.debug, &self.camera)
+        }
+    }
+
+    pub unsafe fn initialize(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+    ) -> anyhow::Result<()> {
+        let renderer = RendererInner::new(&self.entry, event_loop)?;
+
+        self.vk
+            .set(renderer)
+            .map_err(|_| ())
+            .expect("should only initialize once");
+
+        Ok(())
+    }
+
+    fn vk(&self) -> &RendererInner {
+        self.vk.get().expect("VulkanRenderer not initialized")
+    }
+
+    pub fn update_ui(&mut self) -> egui::FullOutput {
+        let raw_input = {
+            let mut egui_winit = self.vk().egui_winit.write();
+
+            egui_winit.take_egui_input(&self.vk().window)
+        };
+
+        self.vk().egui_ctx.run(raw_input, |ctx| {
+            self.draw_debug_ui(ctx);
+        })
+    }
+
+    fn draw_debug_ui(&self, ctx: &egui::Context) {
+        // egui::TopBottomPanel::bottom(egui::Id::new("debug_ui"))
+        egui::SidePanel::new(egui::panel::Side::Left, egui::Id::new("debug_ui")).show(ctx, |ui| {
+            ui.heading("Performance");
+            ui.label(format!("FPS: {:.1}", *self.debug.fps.read()));
+            ui.label(format!(
+                "Frame time: {:.3}ms",
+                *self.debug.frame_time.read() * 1000.0
+            ));
+
+            ui.separator();
+
+            ui.heading("Rendering");
+
+            if ui
+                .checkbox(&mut *self.debug.wireframe.write(), "Wireframe")
+                .changed()
+            {
+                println!("Wireframe mode set to {}", *self.debug.wireframe.read());
+            }
+
+            if ui.button("Reset Camera").clicked() {
+                // TODO: Reset camera when we add it
+                println!("Camera reset!");
+            }
+
+            ui.separator();
+        });
+    }
+}
+
+impl Drop for RendererInner {
+    fn drop(&mut self) {
+        unsafe {
+            self.cleanup();
+        }
+    }
+}
+
+impl RendererInner {
     pub fn egui_handle_event(
         &self,
         event: winit::event::WindowEvent,
@@ -150,6 +226,120 @@ impl VulkanApp {
         }
 
         res.consumed.not().then_some(event)
+    }
+
+    unsafe fn draw_frame(
+        &mut self,
+        ui: egui::FullOutput,
+        debug: &DebugState,
+        camera: &Camera,
+    ) -> anyhow::Result<()> {
+        let start_time = std::time::Instant::now();
+
+        let current_frame = self.current_frame.load(std::sync::atomic::Ordering::SeqCst);
+
+        unsafe {
+            self.device
+                .wait_for_fences(&[self.in_flight_fences[current_frame]], true, u64::MAX)?;
+        }
+
+        // Get next image from swapchain
+        let (image_index, _is_suboptimal) = unsafe {
+            self.swapchain_loader.acquire_next_image(
+                self.swapchain,
+                u64::MAX,
+                // Signal this when ready
+                self.image_available_semaphores[current_frame],
+                // Don't use fence here
+                vk::Fence::null(),
+            )?
+        };
+
+        // Reset fence for next time (only after we know we're using this frame)
+        unsafe {
+            self.device
+                .reset_fences(&[self.in_flight_fences[current_frame]])?
+        };
+
+        unsafe { self.update_uniform_buffer(camera) };
+
+        unsafe {
+            self.device
+                .reset_command_buffer(self.command_buffers[current_frame], Default::default())?
+        };
+
+        // Step 4: Record commands
+        self.record_command_buffer(self.command_buffers[current_frame], image_index, ui.clone())?;
+
+        // Step 5: Submit commands to GPU
+        unsafe { self.submit_commands()? };
+
+        // Step 6: Present the result
+        unsafe { self.present_image(image_index)? };
+
+        self.egui_renderer
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .free_textures(&ui.textures_delta.free)?;
+
+        // Step 7: Move to next frame
+        self.current_frame
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |current| Some((current + 1) % MAX_FRAMES_IN_FLIGHT),
+            )
+            .expect("should not fail");
+
+        // Update timing at the end
+        let frame_time = start_time.elapsed().as_secs_f32();
+        *debug.frame_time.write() = frame_time;
+        *debug.fps.write() = if frame_time > 0.0 {
+            1.0 / frame_time
+        } else {
+            0.0
+        };
+
+        Ok(())
+    }
+
+    unsafe fn update_uniform_buffer(&self, camera: &Camera) {
+        // Calculate matrices
+        let model = Mat4::IDENTITY; // No transformation for now (cube at origin)
+
+        let aspect_ratio = self.swapchain_extent.width as f32 / self.swapchain_extent.height as f32;
+        let view = camera.get_view_matrix();
+        let projection = camera.get_projection_matrix(aspect_ratio);
+
+        let ubo = UniformBufferObject {
+            model,
+            view,
+            projection,
+        };
+
+        let current_image = self.current_frame.load(std::sync::atomic::Ordering::SeqCst);
+
+        // Copy to GPU memory
+        let data_ptr = unsafe {
+            self.device
+                .map_memory(
+                    self.uniform_buffers_memory[current_image],
+                    0,
+                    std::mem::size_of::<UniformBufferObject>() as vk::DeviceSize,
+                    vk::MemoryMapFlags::empty(),
+                )
+                .expect("Failed to map uniform buffer memory")
+                as *mut UniformBufferObject
+        };
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(&ubo, data_ptr, 1);
+
+            self.device
+                .unmap_memory(self.uniform_buffers_memory[current_image]);
+        }
     }
 
     pub unsafe fn cleanup(&self) {
@@ -230,19 +420,10 @@ impl VulkanApp {
         }
     }
 
-    pub fn is_initialized(&self) -> bool {
-        self.initialized.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    pub fn initialize(
-        &mut self,
+    pub fn new(
         entry: &ash::Entry,
         ev: &winit::event_loop::ActiveEventLoop,
-    ) -> anyhow::Result<()> {
-        if self.is_initialized() {
-            return Ok(());
-        }
-
+    ) -> anyhow::Result<Self> {
         let attrs = winit::window::Window::default_attributes()
             .with_content_protected(false)
             .with_title("rvoxel")
@@ -349,7 +530,9 @@ impl VulkanApp {
             },
         )?;
 
-        let app_inner = VulkanAppInner {
+        Ok(Self {
+            entry: entry.clone(),
+
             window,
             instance,
             physical_device,
@@ -374,7 +557,7 @@ impl VulkanApp {
             render_finished_semaphores,
             in_flight_fences,
 
-            current_frame: 0,
+            current_frame: 0.into(),
 
             vertex_buffer,
             vertex_buffer_memory,
@@ -398,104 +581,15 @@ impl VulkanApp {
             egui_ctx,
             egui_winit: RwLock::new(egui_winit),
             egui_renderer: Mutex::new(Some(egui_renderer)),
-        };
-
-        self.app = MaybeUninit::new(app_inner);
-        self.initialized
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-
-        Ok(())
-    }
-
-    pub fn new(
-        entry: &ash::Entry,
-        ev: &winit::event_loop::ActiveEventLoop,
-    ) -> anyhow::Result<Self> {
-        let mut uninit = Self::new_uninit();
-
-        uninit.initialize(entry, ev)?;
-
-        Ok(uninit)
-    }
-
-    pub unsafe fn draw_frame(&mut self, ui: egui::FullOutput) -> anyhow::Result<()> {
-        let start_time = std::time::Instant::now();
-
-        unsafe {
-            self.device.wait_for_fences(
-                &[self.in_flight_fences[self.current_frame]],
-                true,
-                u64::MAX,
-            )?;
-        }
-
-        // Get next image from swapchain
-        let (image_index, _is_suboptimal) = unsafe {
-            self.swapchain_loader.acquire_next_image(
-                self.swapchain,
-                u64::MAX,
-                // Signal this when ready
-                self.image_available_semaphores[self.current_frame],
-                // Don't use fence here
-                vk::Fence::null(),
-            )?
-        };
-
-        // Reset fence for next time (only after we know we're using this frame)
-        unsafe {
-            self.device
-                .reset_fences(&[self.in_flight_fences[self.current_frame]])?
-        };
-
-        unsafe { self.update_uniform_buffer(self.current_frame) };
-
-        unsafe {
-            self.device.reset_command_buffer(
-                self.command_buffers[self.current_frame],
-                Default::default(),
-            )?
-        };
-
-        // Step 4: Record commands
-        self.record_command_buffer(
-            self.command_buffers[self.current_frame],
-            image_index,
-            ui.clone(),
-        )?;
-
-        // Step 5: Submit commands to GPU
-        unsafe { self.submit_commands()? };
-
-        // Step 6: Present the result
-        unsafe { self.present_image(image_index)? };
-
-        self.egui_renderer
-            .lock()
-            .unwrap()
-            .as_mut()
-            .unwrap()
-            .free_textures(&ui.textures_delta.free)?;
-
-        // Step 7: Move to next frame
-        self.current_frame = (self.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
-
-        // Update timing at the end
-        let frame_time = start_time.elapsed().as_secs_f32();
-        *self.debug.frame_time.write() = frame_time;
-        *self.debug.fps.write() = if frame_time > 0.0 {
-            1.0 / frame_time
-        } else {
-            0.0
-        };
-
-        Ok(())
+        })
     }
 
     unsafe fn submit_commands(&self) -> anyhow::Result<()> {
-        let wait_semaphores = [self.image_available_semaphores[self.current_frame]];
+        let current_frame = self.current_frame.load(std::sync::atomic::Ordering::SeqCst);
+        let wait_semaphores = [self.image_available_semaphores[current_frame]];
         let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-        let signal_semaphores = [self.render_finished_semaphores[self.current_frame]];
-        let command_buffers = [self.command_buffers[self.current_frame]];
+        let signal_semaphores = [self.render_finished_semaphores[current_frame]];
+        let command_buffers = [self.command_buffers[current_frame]];
 
         let submit_info = vk::SubmitInfo::default()
             .wait_semaphores(&wait_semaphores) // Don't start until image is available
@@ -507,7 +601,7 @@ impl VulkanApp {
             self.device.queue_submit(
                 self.graphics_queue,
                 &[submit_info],
-                self.in_flight_fences[self.current_frame], // Signal fence when GPU work is done
+                self.in_flight_fences[current_frame], // Signal fence when GPU work is done
             )?
         };
 
@@ -515,7 +609,8 @@ impl VulkanApp {
     }
 
     unsafe fn present_image(&self, image_index: u32) -> anyhow::Result<()> {
-        let wait_semaphores = [self.render_finished_semaphores[self.current_frame]];
+        let current_frame = self.current_frame.load(std::sync::atomic::Ordering::SeqCst);
+        let wait_semaphores = [self.render_finished_semaphores[current_frame]];
         let swapchains = [self.swapchain];
         let image_indices = [image_index];
 
@@ -538,6 +633,8 @@ impl VulkanApp {
         image_idx: u32,
         ui: egui::FullOutput,
     ) -> anyhow::Result<()> {
+        let current_frame = self.current_frame.load(std::sync::atomic::Ordering::SeqCst);
+
         // Start recording
         let begin_info = vk::CommandBufferBeginInfo::default();
         unsafe {
@@ -599,7 +696,7 @@ impl VulkanApp {
                 vk::PipelineBindPoint::GRAPHICS,
                 self.pipeline_layout,
                 0,
-                &[self.descriptor_sets[self.current_frame]],
+                &[self.descriptor_sets[current_frame]],
                 &[],
             );
 
@@ -959,41 +1056,6 @@ impl VulkanApp {
         Ok((buffers, buffers_memory))
     }
 
-    unsafe fn update_uniform_buffer(&mut self, current_image: usize) {
-        // Calculate matrices
-        let model = Mat4::IDENTITY; // No transformation for now (cube at origin)
-
-        let aspect_ratio = self.swapchain_extent.width as f32 / self.swapchain_extent.height as f32;
-        let view = self.camera.get_view_matrix();
-        let projection = self.camera.get_projection_matrix(aspect_ratio);
-
-        let ubo = UniformBufferObject {
-            model,
-            view,
-            projection,
-        };
-
-        // Copy to GPU memory
-        let data_ptr = unsafe {
-            self.device
-                .map_memory(
-                    self.uniform_buffers_memory[current_image],
-                    0,
-                    std::mem::size_of::<UniformBufferObject>() as vk::DeviceSize,
-                    vk::MemoryMapFlags::empty(),
-                )
-                .expect("Failed to map uniform buffer memory")
-                as *mut UniformBufferObject
-        };
-
-        unsafe {
-            std::ptr::copy_nonoverlapping(&ubo, data_ptr, 1);
-
-            self.device
-                .unmap_memory(self.uniform_buffers_memory[current_image]);
-        }
-    }
-
     unsafe fn create_index_buffer(
         device: &ash::Device,
         instance: &ash::Instance,
@@ -1241,52 +1303,6 @@ impl VulkanApp {
             render_finished_semaphores,
             in_flight_fences,
         ))
-    }
-
-    pub fn update_ui(&mut self) -> egui::FullOutput {
-        let raw_input = {
-            let mut egui_winit = self.egui_winit.write();
-
-            egui_winit.take_egui_input(&self.window)
-        };
-
-        self.egui_ctx.run(raw_input, |ctx| {
-            self.draw_debug_ui(ctx);
-        })
-    }
-
-    fn draw_debug_ui(&self, ctx: &egui::Context) {
-        // egui::TopBottomPanel::bottom(egui::Id::new("debug_ui"))
-        egui::SidePanel::new(egui::panel::Side::Left, egui::Id::new("debug_ui")).show(ctx, |ui| {
-            if !self.is_initialized() {
-                return;
-            }
-
-            ui.heading("Performance");
-            ui.label(format!("FPS: {:.1}", *self.debug.fps.read()));
-            ui.label(format!(
-                "Frame time: {:.3}ms",
-                *self.debug.frame_time.read() * 1000.0
-            ));
-
-            ui.separator();
-
-            ui.heading("Rendering");
-
-            if ui
-                .checkbox(&mut *self.debug.wireframe.write(), "Wireframe")
-                .changed()
-            {
-                println!("Wireframe mode set to {}", *self.debug.wireframe.read());
-            }
-
-            if ui.button("Reset Camera").clicked() {
-                // TODO: Reset camera when we add it
-                println!("Camera reset!");
-            }
-
-            ui.separator();
-        });
     }
 
     unsafe fn find_memory_type(
@@ -1546,25 +1562,5 @@ impl VulkanApp {
         println!("Graphics pipeline created");
 
         Ok((graphics_pipeline, pipeline_layout))
-    }
-}
-
-impl std::ops::Deref for VulkanApp {
-    type Target = VulkanAppInner;
-
-    fn deref(&self) -> &Self::Target {
-        if !self.initialized.load(std::sync::atomic::Ordering::SeqCst) {
-            panic!("Attempted to deref uninitialized VulkanApp");
-        }
-        unsafe { &*self.app.as_ptr() }
-    }
-}
-
-impl std::ops::DerefMut for VulkanApp {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        if !self.initialized.load(std::sync::atomic::Ordering::SeqCst) {
-            panic!("Attempted to deref_mut uninitialized VulkanApp");
-        }
-        unsafe { &mut *self.app.as_mut_ptr() }
     }
 }

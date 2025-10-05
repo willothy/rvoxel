@@ -1,36 +1,27 @@
-use vulkan::VulkanApp;
 use winit::application::ApplicationHandler;
 
-pub mod shaders;
-pub mod vulkan;
+use crate::renderer::vulkan::VulkanRenderer;
 
 pub struct App {
-    entry: ash::Entry,
-
-    vk: VulkanApp,
+    vk: VulkanRenderer,
 }
 
 impl App {
     pub fn new() -> anyhow::Result<Self> {
+        let entry = unsafe { ash::Entry::load()? };
+
         Ok(Self {
-            entry: unsafe { ash::Entry::load()? },
-            vk: VulkanApp::new_uninit(),
+            vk: VulkanRenderer::new(entry),
         })
     }
 
-    pub fn cleanup(&mut self) {
-        unsafe { self.vk.cleanup() };
-    }
-
-    pub fn intialize(
+    pub unsafe fn intialize(
         &mut self,
         event_loop: &winit::event_loop::ActiveEventLoop,
     ) -> anyhow::Result<()> {
-        if self.vk.is_initialized() {
-            return Ok(());
+        unsafe {
+            self.vk.initialize(event_loop)?;
         }
-
-        self.vk.initialize(&self.entry, event_loop)?;
 
         Ok(())
     }
@@ -38,13 +29,15 @@ impl App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
-        if let Err(e) = self.intialize(event_loop) {
-            eprintln!("Failed to initialize application: {}", e);
+        unsafe {
+            if let Err(e) = self.intialize(event_loop) {
+                eprintln!("Failed to initialize application: {}", e);
+            }
         }
 
         let ui = self.vk.update_ui();
 
-        if let Err(e) = unsafe { self.vk.draw_frame(ui) } {
+        if let Err(e) = self.vk.draw_frame(ui) {
             eprintln!("Error: {e}")
         }
     }
@@ -55,13 +48,7 @@ impl ApplicationHandler for App {
         _window_id: winit::window::WindowId,
         event: winit::event::WindowEvent,
     ) {
-        if !self.vk.is_initialized() {
-            return;
-        }
-
-        let event = self.vk.egui_handle_event(event);
-
-        let Some(event) = event else {
+        let Some(event) = self.vk.handle_egui_event(event) else {
             // egui handled the event
             return;
         };
@@ -73,7 +60,7 @@ impl ApplicationHandler for App {
             winit::event::WindowEvent::RedrawRequested => {
                 let ui = self.vk.update_ui();
 
-                if let Err(e) = unsafe { self.vk.draw_frame(ui) } {
+                if let Err(e) = self.vk.draw_frame(ui) {
                     eprintln!("Error: {e}")
                 }
             }

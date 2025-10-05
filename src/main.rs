@@ -3,6 +3,7 @@ use glam::{Mat4, Vec3};
 use winit::event_loop::EventLoop;
 
 pub mod app;
+pub mod renderer;
 
 pub struct Camera {
     position: Vec3,
@@ -265,8 +266,6 @@ async fn main() -> anyhow::Result<()> {
     let mut app = app::App::new()?;
 
     event_loop.run_app(&mut app)?;
-
-    app.cleanup();
 
     Ok(())
 }
