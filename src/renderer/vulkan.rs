@@ -1366,8 +1366,8 @@ impl RendererInner {
         flags |= ash::vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
 
         let layer_names = [
-            // #[cfg(debug_assertions)]
-            // ash::ext::validation_features::NAME.as_ptr(),
+            #[cfg(debug_assertions)]
+            ("VK_LAYER_KHRONOS_validation\0".as_ptr() as *const i8),
         ];
 
         let create_info = ash::vk::InstanceCreateInfo::default()

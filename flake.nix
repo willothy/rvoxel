@@ -16,11 +16,12 @@
           wayland
           vulkan-tools
           vulkan-loader
+          vulkan-caps-viewer
           vulkan-headers
           vulkan-extension-layer
-          vulkan-caps-viewer
           vulkan-validation-layers
-          vulkan-utility-llibraries
+          vulkan-utility-libraries
+          vulkan-tools-lunarg
         ];
       in
       {
@@ -39,6 +40,8 @@
           RUST_LOG = "debug";
           RUST_SRC_PATH = "${pkgs.rust.packages.stable.rustPlatform.rustLibSrc}";
           LD_LIBRARY_PATH = libPath;
+          VULKAN_SDK = libPath;
+          VK_LAYER_PATH = "${pkgs.vulkan-validation-layers}/share/vulkan/explicit_layer.d";
         };
       }
     );
