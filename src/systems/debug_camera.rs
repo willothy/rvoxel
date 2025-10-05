@@ -14,14 +14,16 @@ pub fn debug_camera_system(
     time: Res<Time>,
 ) {
     for (mut transform, mut controller) in query.iter_mut() {
-        // Mouse look
-        controller.yaw += input.mouse_delta.0 * controller.mouse_sensitivity;
-        controller.pitch -= input.mouse_delta.1 * controller.mouse_sensitivity;
+        if input.cursor_locked {
+            // Mouse look
+            controller.yaw += input.mouse_delta.0 * controller.mouse_sensitivity;
+            controller.pitch -= input.mouse_delta.1 * controller.mouse_sensitivity;
 
-        // Clamp pitch
-        controller.pitch = controller
-            .pitch
-            .clamp(-89.0_f32.to_radians(), 89.0_f32.to_radians());
+            // Clamp pitch
+            controller.pitch = controller
+                .pitch
+                .clamp(-89.0_f32.to_radians(), 89.0_f32.to_radians());
+        }
 
         // Calculate forward and right vectors
         let right = Vec3::new(
@@ -36,10 +38,10 @@ pub fn debug_camera_system(
         // Movement
         let speed = controller.movement_speed * time.delta;
 
-        if input.is_key_pressed(KeyCode::KeyW) {
+        if input.is_key_pressed(KeyCode::KeyS) {
             transform.position += forward * speed;
         }
-        if input.is_key_pressed(KeyCode::KeyS) {
+        if input.is_key_pressed(KeyCode::KeyW) {
             transform.position -= forward * speed;
         }
         if input.is_key_pressed(KeyCode::KeyD) {
@@ -49,10 +51,10 @@ pub fn debug_camera_system(
             transform.position -= right * speed;
         }
         if input.is_key_pressed(KeyCode::Space) {
-            transform.position += Vec3::Y * speed;
+            transform.position -= Vec3::Y * speed;
         }
         if input.is_key_pressed(KeyCode::ShiftLeft) {
-            transform.position -= Vec3::Y * speed;
+            transform.position += Vec3::Y * speed;
         }
     }
 }

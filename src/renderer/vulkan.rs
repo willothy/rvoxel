@@ -1,16 +1,20 @@
 use std::{
     ffi::CStr,
     ops::Not,
-    sync::{atomic::AtomicUsize, Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize},
+        Arc, OnceLock,
+    },
 };
 
 use anyhow::Context;
 use ash::{khr::surface, vk};
 use bevy_ecs::prelude::*;
-use egui::mutex::RwLock;
 use glam::Mat4;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::Window;
+
+use parking_lot::{Mutex, RwLock};
 
 use crate::{
     components::{
@@ -23,7 +27,7 @@ use crate::{
 
 struct RendererInner {
     /// The window that we are rendering to, from [`winit`].
-    window: winit::window::Window,
+    window: Arc<winit::window::Window>,
 
     /// The Vulkan instance.
     ///
@@ -96,8 +100,10 @@ struct RendererInner {
     pipeline_layout: vk::PipelineLayout,
 
     egui_ctx: egui::Context,
-    egui_winit: RwLock<egui_winit::State>,
+    egui_winit: Mutex<egui_winit::State>,
     egui_renderer: Mutex<Option<egui_ash_renderer::Renderer>>,
+
+    shutdown: Arc<AtomicBool>,
 }
 
 pub struct DebugState {
@@ -110,6 +116,8 @@ const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
 #[derive(Resource, Clone)]
 pub struct VulkanRenderer {
+    shutdown: Arc<AtomicBool>,
+
     entry: ash::Entry,
 
     vk: Arc<OnceLock<RendererInner>>,
@@ -118,8 +126,9 @@ pub struct VulkanRenderer {
 }
 
 impl VulkanRenderer {
-    pub fn new(entry: ash::Entry) -> Self {
+    pub fn new(entry: ash::Entry, shutdown: Arc<AtomicBool>) -> Self {
         Self {
+            shutdown,
             entry,
             vk: Arc::new(OnceLock::new()),
             debug: Arc::new(DebugState {
@@ -128,6 +137,10 @@ impl VulkanRenderer {
                 wireframe: RwLock::new(false),
             }),
         }
+    }
+
+    pub fn window(&self) -> Arc<winit::window::Window> {
+        Arc::clone(&self.vk.get().unwrap().window)
     }
 
     pub fn handle_egui_event(
@@ -147,6 +160,10 @@ impl VulkanRenderer {
         camera: &Camera,
         meshes: &[(&Mesh, &Transform)],
     ) -> anyhow::Result<()> {
+        if self.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
+
         let vk_mut = self.vk.get().unwrap();
 
         let ui = vk_mut.draw_ui(|ctx| {
@@ -186,7 +203,7 @@ impl VulkanRenderer {
         &self,
         event_loop: &winit::event_loop::ActiveEventLoop,
     ) -> anyhow::Result<()> {
-        let renderer = RendererInner::new(&self.entry, event_loop)?;
+        let renderer = RendererInner::new(Arc::clone(&self.shutdown), &self.entry, event_loop)?;
 
         self.vk
             .set(renderer)
@@ -203,6 +220,9 @@ impl VulkanRenderer {
 
 impl Drop for RendererInner {
     fn drop(&mut self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
         unsafe {
             self.cleanup();
         }
@@ -214,10 +234,7 @@ impl RendererInner {
         &self,
         event: winit::event::WindowEvent,
     ) -> Option<winit::event::WindowEvent> {
-        let res = self
-            .egui_winit
-            .write()
-            .on_window_event(&self.window, &event);
+        let res = self.egui_winit.lock().on_window_event(&self.window, &event);
 
         if res.repaint {
             self.window.request_redraw();
@@ -228,13 +245,13 @@ impl RendererInner {
 
     pub fn egui_handle_mouse_motion(&self, event: &winit::event::DeviceEvent) {
         if let winit::event::DeviceEvent::MouseMotion { delta } = event {
-            self.egui_winit.write().on_mouse_motion((delta.0, delta.1));
+            self.egui_winit.lock().on_mouse_motion((delta.0, delta.1));
         }
     }
 
     pub fn draw_ui(&self, draw: impl FnMut(&egui::Context)) -> egui::FullOutput {
         let raw_input = {
-            let mut egui_winit = self.egui_winit.write();
+            let mut egui_winit = self.egui_winit.lock();
 
             egui_winit.take_egui_input(&self.window)
         };
@@ -249,6 +266,10 @@ impl RendererInner {
         camera: &Camera,
         camera_transform: &Transform,
     ) -> anyhow::Result<()> {
+        if self.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
+
         let start_time = std::time::Instant::now();
 
         let current_frame = self.current_frame.load(std::sync::atomic::Ordering::SeqCst);
@@ -294,7 +315,6 @@ impl RendererInner {
 
         self.egui_renderer
             .lock()
-            .unwrap()
             .as_mut()
             .unwrap()
             .free_textures(&ui.textures_delta.free)?;
@@ -425,7 +445,7 @@ impl RendererInner {
             self.surface_loader.destroy_surface(self.surface, None);
 
             // Destroy egui renderer and state
-            drop(self.egui_renderer.lock().unwrap().take());
+            drop(self.egui_renderer.lock().take());
 
             // Destroy logical device
             self.device.destroy_device(None);
@@ -436,6 +456,7 @@ impl RendererInner {
     }
 
     pub fn new(
+        shutdown: Arc<AtomicBool>,
         entry: &ash::Entry,
         ev: &winit::event_loop::ActiveEventLoop,
     ) -> anyhow::Result<Self> {
@@ -546,7 +567,9 @@ impl RendererInner {
         )?;
 
         Ok(Self {
-            window,
+            shutdown,
+
+            window: Arc::new(window),
             instance,
             physical_device,
             device,
@@ -592,7 +615,7 @@ impl RendererInner {
             graphics_pipeline,
             pipeline_layout,
             egui_ctx,
-            egui_winit: RwLock::new(egui_winit),
+            egui_winit: Mutex::new(egui_winit),
             egui_renderer: Mutex::new(Some(egui_renderer)),
         })
     }
@@ -734,20 +757,16 @@ impl RendererInner {
 
         // Render egui
         if !clipped_primitives.is_empty() {
-            // tracing::info!(
-            //     "Rendering egui with {} clipped primitives",
-            //     clipped_primitives.len()
-            // );
+            let mut renderer_guard = self.egui_renderer.lock();
+            let renderer = renderer_guard.as_mut().unwrap();
 
-            let mut renderer = self.egui_renderer.lock().unwrap();
-
-            renderer.as_mut().unwrap().set_textures(
+            renderer.set_textures(
                 self.graphics_queue,
                 self.command_pool,
                 &output.textures_delta.set,
             )?;
 
-            if let Err(e) = renderer.as_mut().unwrap().cmd_draw(
+            if let Err(e) = renderer.cmd_draw(
                 command_buffer,
                 vk::Extent2D {
                     width: self.swapchain_extent.width,

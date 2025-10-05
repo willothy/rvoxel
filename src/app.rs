@@ -1,3 +1,5 @@
+use std::sync::{atomic::AtomicBool, Arc};
+
 use bevy_ecs::{intern::Interned, prelude::*, query::QuerySingleError, schedule::ScheduleLabel};
 use winit::{
     application::ApplicationHandler,
@@ -12,16 +14,19 @@ use crate::{
         transform::Transform,
     },
     renderer::vulkan::VulkanRenderer,
-    resources::{input::InputState, time::Time},
+    resources::{input::InputState, time::Time, window_handle::WindowHandle},
 };
 
 pub struct App {
+    shutdown: Arc<AtomicBool>,
     world: World,
     schedule: Interned<dyn ScheduleLabel>,
 }
 
 impl App {
     pub fn new() -> anyhow::Result<Self> {
+        let shutdown = Arc::new(false.into());
+
         let entry = unsafe { ash::Entry::load()? };
 
         let mut world = World::new();
@@ -29,7 +34,7 @@ impl App {
         world.insert_resource(crate::resources::time::Time::default());
         world.insert_resource(crate::resources::input::InputState::default());
 
-        let vk = VulkanRenderer::new(entry);
+        let vk = VulkanRenderer::new(entry, Arc::clone(&shutdown));
         world.insert_resource(vk);
 
         let mut schedule = Schedule::default();
@@ -56,6 +61,7 @@ impl App {
         world.add_schedule(schedule);
 
         Ok(Self {
+            shutdown,
             world,
             schedule: label,
         })
@@ -77,9 +83,10 @@ impl App {
             renderer.initialize(event_loop)?;
         }
 
-        // self.world.insert_resource(InputState{
-        //     state:
-        // })
+        self.world
+            .insert_resource(crate::resources::window_handle::WindowHandle {
+                window: self.renderer().window(),
+            });
 
         Ok(())
     }
@@ -120,6 +127,11 @@ impl ApplicationHandler for App {
         }
     }
 
+    fn exiting(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         self.world.run_schedule(self.schedule);
     }
@@ -133,9 +145,9 @@ impl ApplicationHandler for App {
         if let winit::event::DeviceEvent::MouseMotion { delta } = event {
             self.renderer().handle_egui_mouse_motion(&event);
             let mut input = self.world.resource_mut::<InputState>();
-            // if input.cursor_locked {
-            input.mouse_delta = (delta.0 as f32, delta.1 as f32);
-            // }
+            if input.cursor_locked {
+                input.mouse_delta = (delta.0 as f32, delta.1 as f32);
+            }
         }
     }
 
@@ -180,14 +192,15 @@ impl ApplicationHandler for App {
             } => {
                 if let PhysicalKey::Code(keycode) = key_event.physical_key {
                     let mut input = self.world.resource_mut::<InputState>();
+
                     match key_event.state {
                         winit::event::ElementState::Pressed => {
                             input.keys_pressed.insert(keycode);
 
-                            // // Toggle cursor lock
-                            // if keycode == KeyCode::Tab {
-                            //     toggle_cursor_lock(&mut self.world, window);
-                            // }
+                            // Toggle cursor lock
+                            if keycode == KeyCode::Tab {
+                                toggle_cursor_lock(&mut self.world);
+                            }
                         }
                         winit::event::ElementState::Released => {
                             input.keys_pressed.remove(&keycode);
@@ -197,12 +210,37 @@ impl ApplicationHandler for App {
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if button == winit::event::MouseButton::Left {
-                    // if state == winit::event::ElementState::Pressed {
-                    //     lock_cursor(&mut self.world, window);
-                    // }
+                    if state == winit::event::ElementState::Pressed {
+                        lock_cursor(&mut self.world);
+                    }
                 }
             }
             _ => {}
         }
+    }
+}
+
+fn lock_cursor(world: &mut World) {
+    let WindowHandle { window } = world.resource::<WindowHandle>();
+
+    window.set_cursor_visible(false);
+    window
+        .set_cursor_grab(winit::window::CursorGrabMode::Confined)
+        .ok();
+    world.resource_mut::<InputState>().cursor_locked = true;
+}
+
+fn toggle_cursor_lock(world: &mut World) {
+    let WindowHandle { window } = world.resource::<WindowHandle>().clone();
+    let mut input = world.resource_mut::<InputState>();
+
+    if input.cursor_locked {
+        window.set_cursor_visible(true);
+        window
+            .set_cursor_grab(winit::window::CursorGrabMode::None)
+            .ok();
+        input.cursor_locked = false;
+    } else {
+        lock_cursor(world);
     }
 }
