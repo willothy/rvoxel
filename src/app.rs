@@ -18,15 +18,12 @@ use crate::{
 };
 
 pub struct App {
-    shutdown: Arc<AtomicBool>,
     world: World,
     schedule: Interned<dyn ScheduleLabel>,
 }
 
 impl App {
     pub fn new() -> anyhow::Result<Self> {
-        let shutdown = Arc::new(false.into());
-
         let entry = unsafe { ash::Entry::load()? };
 
         let mut world = World::new();
@@ -34,7 +31,7 @@ impl App {
         world.insert_resource(crate::resources::time::Time::default());
         world.insert_resource(crate::resources::input::InputState::default());
 
-        let vk = VulkanRenderer::new(entry, Arc::clone(&shutdown));
+        let vk = VulkanRenderer::new(entry);
         world.insert_resource(vk);
 
         let mut schedule = Schedule::default();
@@ -61,7 +58,6 @@ impl App {
         world.add_schedule(schedule);
 
         Ok(Self {
-            shutdown,
             world,
             schedule: label,
         })
@@ -128,8 +124,7 @@ impl ApplicationHandler for App {
     }
 
     fn exiting(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
-        self.shutdown
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        unsafe { self.renderer().cleanup_vulkan() };
     }
 
     fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
