@@ -8,10 +8,11 @@ use std::{
 use anyhow::Context;
 use ash::{khr::surface, vk};
 use egui::mutex::RwLock;
+use glam::Mat4;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::Window;
 
-use crate::Vertex;
+use crate::{Camera, UniformBufferObject, Vertex};
 
 pub struct VulkanAppInner {
     /// The window that we are rendering to, from [`winit`].
@@ -70,6 +71,16 @@ pub struct VulkanAppInner {
     /// Actual GPU memory allocation for the vertex buffer.
     vertex_buffer_memory: vk::DeviceMemory,
 
+    index_buffer: vk::Buffer,
+    index_buffer_memory: vk::DeviceMemory,
+
+    uniform_buffers: Vec<vk::Buffer>,
+    uniform_buffers_memory: Vec<vk::DeviceMemory>,
+
+    descriptor_pool: vk::DescriptorPool,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    descriptor_sets: Vec<vk::DescriptorSet>,
+
     vert_shader_module: vk::ShaderModule,
     frag_shader_module: vk::ShaderModule,
 
@@ -80,8 +91,6 @@ pub struct VulkanAppInner {
     egui_ctx: egui::Context,
     egui_winit: RwLock<egui_winit::State>,
     egui_renderer: Mutex<Option<egui_ash_renderer::Renderer>>,
-
-    debug: DebugState,
 }
 
 pub struct DebugState {
@@ -95,6 +104,8 @@ const MAX_FRAMES_IN_FLIGHT: usize = 2;
 pub struct VulkanApp {
     app: MaybeUninit<VulkanAppInner>,
     initialized: AtomicBool,
+    debug: DebugState,
+    camera: crate::Camera,
 }
 
 impl Drop for VulkanApp {
@@ -116,6 +127,12 @@ impl VulkanApp {
         Self {
             app: MaybeUninit::uninit(),
             initialized: AtomicBool::new(false),
+            debug: DebugState {
+                fps: RwLock::new(0.),
+                frame_time: RwLock::new(0.),
+                wireframe: RwLock::new(false),
+            },
+            camera: Camera::new(),
         }
     }
 
@@ -155,6 +172,21 @@ impl VulkanApp {
             // Destroy vertex buffer and its memory
             self.device.destroy_buffer(self.vertex_buffer, None);
             self.device.free_memory(self.vertex_buffer_memory, None);
+
+            self.device.destroy_buffer(self.index_buffer, None);
+            self.device.free_memory(self.index_buffer_memory, None);
+
+            // Cleaning up descriptor pool automatically frees descriptor sets
+            self.device
+                .destroy_descriptor_pool(self.descriptor_pool, None);
+            self.device
+                .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+
+            for i in 0..MAX_FRAMES_IN_FLIGHT {
+                self.device.destroy_buffer(self.uniform_buffers[i], None);
+                self.device
+                    .free_memory(self.uniform_buffers_memory[i], None);
+            }
 
             // Destroy graphics pipeline and layout
             self.device.destroy_pipeline(self.graphics_pipeline, None);
@@ -260,6 +292,22 @@ impl VulkanApp {
         let (vertex_buffer, vertex_buffer_memory) =
             Self::create_vertex_buffer(&device, &instance, physical_device)?;
 
+        let (index_buffer, index_buffer_memory) =
+            unsafe { Self::create_index_buffer(&device, &instance, physical_device)? };
+
+        let descriptor_set_layout = unsafe { Self::create_descriptor_set_layout(&device) };
+        let descriptor_pool = unsafe { Self::create_descriptor_pool(&device) };
+        let (uniform_buffers, uniform_buffers_memory) =
+            unsafe { Self::create_uniform_buffers(&device, &instance, physical_device)? };
+        let descriptor_sets = unsafe {
+            Self::create_descriptor_sets(
+                &device,
+                descriptor_pool,
+                descriptor_set_layout,
+                &uniform_buffers,
+            )?
+        };
+
         let vert_shader_module = unsafe {
             Self::create_shader_module(&device, &super::shaders::compile_vertex_shader()?)?
         };
@@ -275,6 +323,7 @@ impl VulkanApp {
             render_pass,
             vert_shader_module,
             frag_shader_module,
+            descriptor_set_layout,
         )?;
 
         let (swapchain_image_views, swapchain_framebuffers) = unsafe {
@@ -330,6 +379,16 @@ impl VulkanApp {
             vertex_buffer,
             vertex_buffer_memory,
 
+            index_buffer,
+            index_buffer_memory,
+
+            uniform_buffers,
+            uniform_buffers_memory,
+
+            descriptor_set_layout,
+            descriptor_pool,
+            descriptor_sets,
+
             vert_shader_module,
             frag_shader_module,
 
@@ -339,12 +398,6 @@ impl VulkanApp {
             egui_ctx,
             egui_winit: RwLock::new(egui_winit),
             egui_renderer: Mutex::new(Some(egui_renderer)),
-
-            debug: DebugState {
-                fps: RwLock::new(0.),
-                frame_time: RwLock::new(0.),
-                wireframe: RwLock::new(false),
-            },
         };
 
         self.app = MaybeUninit::new(app_inner);
@@ -392,6 +445,15 @@ impl VulkanApp {
         unsafe {
             self.device
                 .reset_fences(&[self.in_flight_fences[self.current_frame]])?
+        };
+
+        unsafe { self.update_uniform_buffer(self.current_frame) };
+
+        unsafe {
+            self.device.reset_command_buffer(
+                self.command_buffers[self.current_frame],
+                Default::default(),
+            )?
         };
 
         // Step 4: Record commands
@@ -524,16 +586,32 @@ impl VulkanApp {
                 .cmd_bind_vertex_buffers(command_buffer, 0, &vertex_buffers, &offsets)
         };
 
-        // Draw the triangle!
         unsafe {
-            self.device.cmd_draw(
+            self.device.cmd_bind_index_buffer(
                 command_buffer,
-                3, // vertex count (triangle = 3 vertices)
-                1, // instance count (just 1 triangle)
-                0, // first vertex
-                0, // first instance
-            )
-        };
+                self.index_buffer,
+                0,
+                vk::IndexType::UINT16,
+            );
+
+            self.device.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.pipeline_layout,
+                0,
+                &[self.descriptor_sets[self.current_frame]],
+                &[],
+            );
+
+            self.device.cmd_draw_indexed(
+                command_buffer,
+                crate::shapes::CUBE_INDICES.len() as u32,
+                1,
+                0,
+                0,
+                0,
+            );
+        }
 
         // UI
         // In record_command_buffer, after your triangle rendering but before cmd_end_render_pass:
@@ -750,6 +828,244 @@ impl VulkanApp {
         Ok((image_views, framebuffers))
     }
 
+    unsafe fn create_descriptor_set_layout(device: &ash::Device) -> vk::DescriptorSetLayout {
+        let ubo_layout_binding = vk::DescriptorSetLayoutBinding::default()
+            .binding(0) // binding = 0 in shader
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::VERTEX); // Used in vertex shader
+
+        let bindings = [ubo_layout_binding];
+        let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+
+        unsafe {
+            device
+                .create_descriptor_set_layout(&layout_info, None)
+                .expect("Failed to create descriptor set layout")
+        }
+    }
+
+    unsafe fn create_descriptor_sets(
+        device: &ash::Device,
+        descriptor_pool: vk::DescriptorPool,
+        descriptor_set_layout: vk::DescriptorSetLayout,
+        uniform_buffers: &[vk::Buffer],
+    ) -> anyhow::Result<Vec<vk::DescriptorSet>> {
+        let layouts = vec![descriptor_set_layout; MAX_FRAMES_IN_FLIGHT];
+
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(descriptor_pool)
+            .set_layouts(&layouts);
+
+        let descriptor_sets = unsafe {
+            device
+                .allocate_descriptor_sets(&alloc_info)
+                .context("Failed to allocate descriptor sets")?
+        };
+
+        // Update descriptor sets to point to uniform buffers
+        for i in 0..MAX_FRAMES_IN_FLIGHT {
+            let buffer_info = vk::DescriptorBufferInfo::default()
+                .buffer(uniform_buffers[i])
+                .offset(0)
+                .range(std::mem::size_of::<crate::UniformBufferObject>() as vk::DeviceSize);
+
+            let descriptor_write = vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_sets[i])
+                .dst_binding(0)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .buffer_info(std::slice::from_ref(&buffer_info));
+
+            unsafe { device.update_descriptor_sets(&[descriptor_write], &[]) };
+        }
+
+        println!("Descriptor sets created");
+
+        Ok(descriptor_sets)
+    }
+
+    unsafe fn create_descriptor_pool(device: &ash::Device) -> vk::DescriptorPool {
+        let pool_size = vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::UNIFORM_BUFFER)
+            .descriptor_count(MAX_FRAMES_IN_FLIGHT as u32);
+
+        let pool_sizes = [pool_size];
+        let pool_info = vk::DescriptorPoolCreateInfo::default()
+            .pool_sizes(&pool_sizes)
+            .max_sets(MAX_FRAMES_IN_FLIGHT as u32);
+
+        unsafe {
+            device
+                .create_descriptor_pool(&pool_info, None)
+                .expect("Failed to create descriptor pool")
+        }
+    }
+
+    unsafe fn create_uniform_buffers(
+        device: &ash::Device,
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+    ) -> anyhow::Result<(Vec<vk::Buffer>, Vec<vk::DeviceMemory>)> {
+        let buffer_size = std::mem::size_of::<crate::UniformBufferObject>() as vk::DeviceSize;
+
+        let mut buffers = Vec::new();
+        let mut buffers_memory = Vec::new();
+
+        for _ in 0..MAX_FRAMES_IN_FLIGHT {
+            let buffer_info = vk::BufferCreateInfo::default()
+                .size(buffer_size)
+                .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+            let buffer = unsafe {
+                device
+                    .create_buffer(&buffer_info, None)
+                    .context("Failed to create uniform buffer")?
+            };
+
+            let mem_requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
+            let memory_type_index = unsafe {
+                Self::find_memory_type(
+                    instance,
+                    physical_device,
+                    mem_requirements.memory_type_bits,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                )?
+            };
+
+            let alloc_info = vk::MemoryAllocateInfo::default()
+                .allocation_size(mem_requirements.size)
+                .memory_type_index(memory_type_index);
+
+            let buffer_memory = unsafe {
+                device
+                    .allocate_memory(&alloc_info, None)
+                    .context("Failed to allocate uniform buffer memory")?
+            };
+
+            unsafe {
+                device
+                    .bind_buffer_memory(buffer, buffer_memory, 0)
+                    .context("Failed to bind uniform buffer memory")?
+            };
+
+            buffers.push(buffer);
+            buffers_memory.push(buffer_memory);
+        }
+
+        println!("Uniform buffers created");
+
+        Ok((buffers, buffers_memory))
+    }
+
+    unsafe fn update_uniform_buffer(&mut self, current_image: usize) {
+        // Calculate matrices
+        let model = Mat4::IDENTITY; // No transformation for now (cube at origin)
+
+        let aspect_ratio = self.swapchain_extent.width as f32 / self.swapchain_extent.height as f32;
+        let view = self.camera.get_view_matrix();
+        let projection = self.camera.get_projection_matrix(aspect_ratio);
+
+        let ubo = UniformBufferObject {
+            model,
+            view,
+            projection,
+        };
+
+        // Copy to GPU memory
+        let data_ptr = unsafe {
+            self.device
+                .map_memory(
+                    self.uniform_buffers_memory[current_image],
+                    0,
+                    std::mem::size_of::<UniformBufferObject>() as vk::DeviceSize,
+                    vk::MemoryMapFlags::empty(),
+                )
+                .expect("Failed to map uniform buffer memory")
+                as *mut UniformBufferObject
+        };
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(&ubo, data_ptr, 1);
+
+            self.device
+                .unmap_memory(self.uniform_buffers_memory[current_image]);
+        }
+    }
+
+    unsafe fn create_index_buffer(
+        device: &ash::Device,
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+    ) -> anyhow::Result<(vk::Buffer, vk::DeviceMemory)> {
+        let buffer_size =
+            (std::mem::size_of::<u16>() * crate::shapes::CUBE_INDICES.len()) as vk::DeviceSize;
+
+        // Create buffer
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(buffer_size)
+            .usage(vk::BufferUsageFlags::INDEX_BUFFER) // Index buffer usage
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+        let buffer = unsafe {
+            device
+                .create_buffer(&buffer_info, None)
+                .context("Failed to create index buffer")?
+        };
+
+        // Allocate memory
+        let mem_requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
+        let memory_type_index = unsafe {
+            Self::find_memory_type(
+                instance,
+                physical_device,
+                mem_requirements.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )?
+        };
+
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(mem_requirements.size)
+            .memory_type_index(memory_type_index);
+
+        let buffer_memory = unsafe {
+            device
+                .allocate_memory(&alloc_info, None)
+                .context("Failed to allocate index buffer memory")?
+        };
+
+        unsafe {
+            device
+                .bind_buffer_memory(buffer, buffer_memory, 0)
+                .context("Failed to bind index buffer memory")?
+        };
+
+        // Upload index data
+        let data_ptr = unsafe {
+            device
+                .map_memory(buffer_memory, 0, buffer_size, vk::MemoryMapFlags::empty())
+                .context("Failed to map index buffer memory")? as *mut u16
+        };
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                crate::shapes::CUBE_INDICES.as_ptr(),
+                data_ptr,
+                crate::shapes::CUBE_INDICES.len(),
+            )
+        };
+
+        unsafe { device.unmap_memory(buffer_memory) };
+
+        println!(
+            "Index buffer created with {} indices",
+            crate::shapes::CUBE_INDICES.len()
+        );
+
+        Ok((buffer, buffer_memory))
+    }
+
     unsafe fn create_surface(
         entry: &ash::Entry,
         instance: &ash::Instance,
@@ -942,6 +1258,10 @@ impl VulkanApp {
     fn draw_debug_ui(&self, ctx: &egui::Context) {
         // egui::TopBottomPanel::bottom(egui::Id::new("debug_ui"))
         egui::SidePanel::new(egui::panel::Side::Left, egui::Id::new("debug_ui")).show(ctx, |ui| {
+            if !self.is_initialized() {
+                return;
+            }
+
             ui.heading("Performance");
             ui.label(format!("FPS: {:.1}", *self.debug.fps.read()));
             ui.label(format!(
@@ -1002,8 +1322,8 @@ impl VulkanApp {
         instance: &ash::Instance,
         physical_device: vk::PhysicalDevice,
     ) -> anyhow::Result<(vk::Buffer, vk::DeviceMemory)> {
-        let buffer_size =
-            (std::mem::size_of::<crate::Vertex>() * crate::VERTICES.len()) as vk::DeviceSize;
+        let buffer_size = (std::mem::size_of::<crate::Vertex>()
+            * crate::shapes::CUBE_VERTICES.len()) as vk::DeviceSize;
 
         // Create the buffer object
         let buffer_info = vk::BufferCreateInfo::default()
@@ -1058,9 +1378,9 @@ impl VulkanApp {
 
             // Copy our vertex data
             std::ptr::copy_nonoverlapping(
-                crate::VERTICES.as_ptr(),
+                crate::shapes::CUBE_VERTICES.as_ptr(),
                 data_ptr,
-                crate::VERTICES.len(),
+                crate::shapes::CUBE_VERTICES.len(),
             );
 
             // Unmap when done
@@ -1109,10 +1429,11 @@ impl VulkanApp {
 
     fn create_graphics_pipeline(
         device: &ash::Device,
-        extent: vk::Extent2D,
+        swapchain_extent: vk::Extent2D,
         render_pass: vk::RenderPass,
         vert_shader_module: vk::ShaderModule,
         frag_shader_module: vk::ShaderModule,
+        descriptor_set_layout: vk::DescriptorSetLayout,
     ) -> anyhow::Result<(vk::Pipeline, vk::PipelineLayout)> {
         // 1. Shader stages - which shaders to use
         let main_function_name = CStr::from_bytes_with_nul(b"main\0")?;
@@ -1145,15 +1466,15 @@ impl VulkanApp {
         let viewports = [vk::Viewport {
             x: 0.0,
             y: 0.0,
-            width: extent.width as f32,
-            height: extent.height as f32,
+            width: swapchain_extent.width as f32,
+            height: swapchain_extent.height as f32,
             min_depth: 0.0,
             max_depth: 1.0,
         }];
 
         let scissors = [vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
-            extent,
+            extent: swapchain_extent,
         }];
 
         let viewport_state = vk::PipelineViewportStateCreateInfo::default()
@@ -1186,11 +1507,13 @@ impl VulkanApp {
             .attachments(std::slice::from_ref(&color_blend_attachment));
 
         // 8. Pipeline layout - uniforms and push constants (none for now)
-        let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(&[]) // No descriptor sets
-            .push_constant_ranges(&[]); // No push constants
-
         let pipeline_layout = unsafe {
+            let set_layouts = [descriptor_set_layout];
+
+            let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(&set_layouts) // No descriptor sets
+                .push_constant_ranges(&[]); // No push constants
+
             device
                 .create_pipeline_layout(&pipeline_layout_info, None)
                 .context("Failed to create pipeline layout")?
