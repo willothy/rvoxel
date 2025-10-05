@@ -2,11 +2,12 @@ use std::{
     ffi::CStr,
     mem::MaybeUninit,
     ops::Not,
-    sync::{atomic::AtomicBool, Mutex, RwLock},
+    sync::{atomic::AtomicBool, Mutex},
 };
 
 use anyhow::Context;
 use ash::{khr::surface, vk};
+use egui::mutex::RwLock;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::Window;
 
@@ -80,9 +81,13 @@ pub struct VulkanAppInner {
     egui_winit: RwLock<egui_winit::State>,
     egui_renderer: Mutex<Option<egui_ash_renderer::Renderer>>,
 
-    // debug_wireframe: bool,
-    debug_fps: f32,
-    debug_frame_time: f32,
+    debug: DebugState,
+}
+
+pub struct DebugState {
+    fps: RwLock<f32>,
+    frame_time: RwLock<f32>,
+    wireframe: RwLock<bool>,
 }
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
@@ -121,7 +126,6 @@ impl VulkanApp {
         let res = self
             .egui_winit
             .write()
-            .unwrap()
             .on_window_event(&self.window, &event);
 
         if res.repaint {
@@ -335,8 +339,12 @@ impl VulkanApp {
             egui_ctx,
             egui_winit: RwLock::new(egui_winit),
             egui_renderer: Mutex::new(Some(egui_renderer)),
-            debug_fps: 0.,
-            debug_frame_time: 0.,
+
+            debug: DebugState {
+                fps: RwLock::new(0.),
+                frame_time: RwLock::new(0.),
+                wireframe: RwLock::new(false),
+            },
         };
 
         self.app = MaybeUninit::new(app_inner);
@@ -411,8 +419,8 @@ impl VulkanApp {
 
         // Update timing at the end
         let frame_time = start_time.elapsed().as_secs_f32();
-        self.debug_frame_time = frame_time;
-        self.debug_fps = if frame_time > 0.0 {
+        *self.debug.frame_time.write() = frame_time;
+        *self.debug.fps.write() = if frame_time > 0.0 {
             1.0 / frame_time
         } else {
             0.0
@@ -921,7 +929,7 @@ impl VulkanApp {
 
     pub fn update_ui(&mut self) -> egui::FullOutput {
         let raw_input = {
-            let mut egui_winit = self.egui_winit.write().unwrap();
+            let mut egui_winit = self.egui_winit.write();
 
             egui_winit.take_egui_input(&self.window)
         };
@@ -935,16 +943,22 @@ impl VulkanApp {
         // egui::TopBottomPanel::bottom(egui::Id::new("debug_ui"))
         egui::SidePanel::new(egui::panel::Side::Left, egui::Id::new("debug_ui")).show(ctx, |ui| {
             ui.heading("Performance");
-            ui.label(format!("FPS: {:.1}", self.debug_fps));
+            ui.label(format!("FPS: {:.1}", *self.debug.fps.read()));
             ui.label(format!(
                 "Frame time: {:.3}ms",
-                self.debug_frame_time * 1000.0
+                *self.debug.frame_time.read() * 1000.0
             ));
 
             ui.separator();
 
             ui.heading("Rendering");
-            ui.checkbox(&mut true, "Wireframe mode");
+
+            if ui
+                .checkbox(&mut *self.debug.wireframe.write(), "Wireframe")
+                .changed()
+            {
+                println!("Wireframe mode set to {}", *self.debug.wireframe.read());
+            }
 
             if ui.button("Reset Camera").clicked() {
                 // TODO: Reset camera when we add it
@@ -952,10 +966,6 @@ impl VulkanApp {
             }
 
             ui.separator();
-
-            ui.heading("Voxels");
-            ui.label("5cm voxel cubes coming soon!");
-            // Later: voxel size, chunk info, physics params
         });
     }
 
