@@ -106,9 +106,11 @@ struct RendererInner {
     /// Where draw commands are recorded before being submitted to the GPU.
     command_buffers: Vec<vk::CommandBuffer>,
 
+    /// Per-frame image semaphores
     image_available_semaphores: Vec<vk::Semaphore>,
     render_finished_semaphores: Vec<vk::Semaphore>,
     in_flight_fences: Vec<vk::Fence>,
+    images_in_flight: Vec<RwLock<vk::Fence>>,
     current_frame: AtomicUsize,
 
     vertex_buffer: vk::Buffer,
@@ -202,9 +204,9 @@ impl VulkanRenderer {
             return Ok(());
         }
 
-        let vk_mut = self.vk.get().unwrap();
+        let vk = self.vk.get().unwrap();
 
-        let ui = vk_mut.draw_ui(|ctx| {
+        let ui = vk.draw_ui(|ctx| {
             egui::SidePanel::new(egui::panel::Side::Left, egui::Id::new("debug_ui_sidepanel"))
                 .show(ctx, |ui| {
                     ui.heading("Performance");
@@ -234,7 +236,7 @@ impl VulkanRenderer {
                 });
         });
 
-        unsafe { vk_mut.draw_frame(ui, &self.debug, camera, camera_transform) }
+        unsafe { vk.draw_frame(ui, &self.debug, camera, camera_transform) }
     }
 
     pub unsafe fn initialize(
@@ -317,6 +319,15 @@ impl RendererInner {
                 .wait_for_fences(&[self.in_flight_fences[current_frame]], true, u64::MAX)?;
         }
 
+        // The current frame's fence is now signaled, so any image that was using this fence is now
+        // free.
+        for fence in self.images_in_flight.iter() {
+            let current = *fence.read();
+            if current == self.in_flight_fences[current_frame] {
+                *fence.write() = vk::Fence::null();
+            }
+        }
+
         // Get next image from swapchain
         let (image_index, _is_suboptimal) = unsafe {
             self.swapchain_loader.acquire_next_image(
@@ -329,6 +340,20 @@ impl RendererInner {
             )?
         };
 
+        {
+            let in_flight = *self.images_in_flight[image_index as usize].read();
+
+            // Wait if this image is already in use by another frame
+            if in_flight != vk::Fence::null() {
+                unsafe {
+                    self.device.wait_for_fences(&[in_flight], true, u64::MAX)?;
+                }
+            }
+        }
+
+        // Mark as in use by the current frame
+        *self.images_in_flight[image_index as usize].write() = self.in_flight_fences[current_frame];
+
         // Reset fence for next time (only after we know we're using this frame)
         unsafe {
             self.device
@@ -338,15 +363,17 @@ impl RendererInner {
         unsafe { self.update_uniform_buffer(camera, camera_transform) };
 
         unsafe {
-            self.device
-                .reset_command_buffer(self.command_buffers[current_frame], Default::default())?
+            self.device.reset_command_buffer(
+                self.command_buffers[current_frame],
+                vk::CommandBufferResetFlags::empty(),
+            )?
         };
 
         // Step 4: Record commands
         self.record_command_buffer(self.command_buffers[current_frame], image_index, ui.clone())?;
 
         // Step 5: Submit commands to GPU
-        unsafe { self.submit_commands()? };
+        unsafe { self.submit_commands(image_index)? };
 
         // Step 6: Present the result
         unsafe { self.present_image(image_index)? };
@@ -549,8 +576,12 @@ impl RendererInner {
 
         let command_buffers = unsafe { Self::create_command_buffers(&device, &command_pool)? };
 
-        let (image_available_semaphores, render_finished_semaphores, in_flight_fences) =
-            unsafe { Self::create_sync_objects(&device)? };
+        let (
+            image_available_semaphores,
+            render_finished_semaphores,
+            in_flight_fences,
+            images_in_flight,
+        ) = unsafe { Self::create_sync_objects(&device, swapchain_images.len())? };
 
         let (vertex_buffer, vertex_buffer_memory) =
             Self::create_vertex_buffer(&device, &instance, physical_device)?;
@@ -643,6 +674,7 @@ impl RendererInner {
             image_available_semaphores,
             render_finished_semaphores,
             in_flight_fences,
+            images_in_flight,
 
             current_frame: 0.into(),
 
@@ -671,11 +703,11 @@ impl RendererInner {
         })
     }
 
-    unsafe fn submit_commands(&self) -> anyhow::Result<()> {
+    unsafe fn submit_commands(&self, image_index: u32) -> anyhow::Result<()> {
         let current_frame = self.current_frame.load(std::sync::atomic::Ordering::SeqCst);
         let wait_semaphores = [self.image_available_semaphores[current_frame]];
         let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-        let signal_semaphores = [self.render_finished_semaphores[current_frame]];
+        let signal_semaphores = [self.render_finished_semaphores[image_index as usize]];
         let command_buffers = [self.command_buffers[current_frame]];
 
         let submit_info = vk::SubmitInfo::default()
@@ -696,8 +728,7 @@ impl RendererInner {
     }
 
     unsafe fn present_image(&self, image_index: u32) -> anyhow::Result<()> {
-        let current_frame = self.current_frame.load(std::sync::atomic::Ordering::SeqCst);
-        let wait_semaphores = [self.render_finished_semaphores[current_frame]];
+        let wait_semaphores = [self.render_finished_semaphores[image_index as usize]];
         let swapchains = [self.swapchain];
         let image_indices = [image_index];
 
@@ -1404,7 +1435,13 @@ impl RendererInner {
 
     unsafe fn create_sync_objects(
         device: &ash::Device,
-    ) -> anyhow::Result<(Vec<vk::Semaphore>, Vec<vk::Semaphore>, Vec<vk::Fence>)> {
+        swapchain_image_count: usize,
+    ) -> anyhow::Result<(
+        Vec<vk::Semaphore>,
+        Vec<vk::Semaphore>,
+        Vec<vk::Fence>,
+        Vec<RwLock<vk::Fence>>,
+    )> {
         let semaphore_info = vk::SemaphoreCreateInfo::default();
         // Start signaled so first frame doesn't wait
         let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
@@ -1415,16 +1452,39 @@ impl RendererInner {
 
         for _ in 0..MAX_FRAMES_IN_FLIGHT {
             unsafe {
-                image_available_semaphores.push(device.create_semaphore(&semaphore_info, None)?);
-                render_finished_semaphores.push(device.create_semaphore(&semaphore_info, None)?);
-                in_flight_fences.push(device.create_fence(&fence_info, None)?);
+                image_available_semaphores.push(
+                    device
+                        .create_semaphore(&semaphore_info, None)
+                        .context("Failed to create image available semaphore")?,
+                );
+                in_flight_fences.push(
+                    device
+                        .create_fence(&fence_info, None)
+                        .context("Failed to create in-flight fence")?,
+                );
             }
         }
+
+        // let mut render_finished_
+        for _ in 0..swapchain_image_count {
+            unsafe {
+                render_finished_semaphores.push(
+                    device
+                        .create_semaphore(&semaphore_info, None)
+                        .context("Failed to create render finished semaphore")?,
+                );
+            }
+        }
+
+        let images_in_flight = Vec::from_iter(
+            std::iter::from_fn(|| Some(RwLock::new(vk::Fence::null()))).take(swapchain_image_count),
+        );
 
         Ok((
             image_available_semaphores,
             render_finished_semaphores,
             in_flight_fences,
+            images_in_flight,
         ))
     }
 
