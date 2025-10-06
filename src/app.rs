@@ -1,6 +1,9 @@
+use std::cell::OnceCell;
 use std::sync::Arc;
 
 use bevy_ecs::{intern::Interned, prelude::*, query::QuerySingleError, schedule::ScheduleLabel};
+use egui::ViewportId;
+use glam::Vec3;
 use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
@@ -20,6 +23,10 @@ use crate::{
 pub struct App {
     world: World,
     schedule: Interned<dyn ScheduleLabel>,
+
+    egui_ctx: egui::Context,
+    egui_state: OnceCell<egui_winit::State>,
+    egui_window: OnceCell<winit::window::Window>,
 }
 
 impl App {
@@ -55,9 +62,15 @@ impl App {
         let label = schedule.label();
         world.add_schedule(schedule);
 
+        let egui_ctx = egui::Context::default();
+
         Ok(Self {
             world,
             schedule: label,
+
+            egui_ctx,
+            egui_state: OnceCell::new(),
+            egui_window: OnceCell::new(),
         })
     }
 
@@ -82,6 +95,44 @@ impl App {
                 window: self.renderer().window(),
             });
 
+        let egui_viewport = egui::ViewportBuilder::default()
+            .with_visible(true)
+            // .with_title("RVoxel Debug")
+            // .with_resizable(true)
+            // .with_inner_size(egui::Vec2::new(800., 600.))
+            // .with_titlebar_buttons_shown(true)
+            // .with_taskbar(true)
+        ;
+
+        let egui_window = egui_winit::create_window(&self.egui_ctx, event_loop, &egui_viewport)?;
+
+        // let attrs = winit::window::Window::default_attributes()
+        //     .with_content_protected(false)
+        //     .with_title("rvoxel debug")
+        //     .with_visible(true);
+        //
+        // let egui_window = event_loop.create_window(attrs)?;
+        //
+        // egui_window.set_visible(true);
+
+        let egui_state = egui_winit::State::new(
+            self.egui_ctx.clone(),
+            self.egui_ctx.viewport_id(),
+            &egui_window,
+            None,
+            None,
+            None,
+        );
+
+        self.egui_state
+            .set(egui_state)
+            .map_err(|_| ())
+            .expect("should only be initialized once");
+        self.egui_window
+            .set(egui_window)
+            .map_err(|_| ())
+            .expect("should only be initialized once");
+
         Ok(())
     }
 
@@ -93,6 +144,73 @@ impl App {
     pub fn meshes_with_transforms(&'_ mut self) -> Vec<(&Mesh, &Transform)> {
         let mut query = self.world.query::<(&Mesh, &Transform)>();
         query.iter(&self.world).collect::<Vec<_>>()
+    }
+
+    fn draw_ui(&mut self) {
+        let input = self
+            .egui_state
+            .get_mut()
+            .unwrap()
+            .take_egui_input(&self.egui_window.get().unwrap());
+
+        let camera_transform = self.camera_and_transform().unwrap().1.clone();
+
+        let ui = self.egui_ctx.run(input, |ctx| {
+            egui::SidePanel::new(egui::panel::Side::Left, egui::Id::new("debug_ui_sidepanel"))
+                .show(ctx, |ui| {
+                    let renderer = self.renderer();
+
+                    ui.heading("Performance");
+                    ui.label(format!("FPS: {:.1}", *renderer.debug().fps.read()));
+                    ui.label(format!(
+                        "Frame time: {:.3}ms",
+                        *renderer.debug().frame_time.read() * 1000.0
+                    ));
+
+                    ui.separator();
+
+                    ui.heading("Rendering");
+
+                    if ui
+                        .checkbox(&mut *renderer.debug().wireframe.write(), "Wireframe")
+                        .changed()
+                    {
+                        tracing::info!(
+                            "Wireframe mode set to {}",
+                            *renderer.debug().wireframe.read()
+                        );
+                    }
+
+                    ui.separator();
+
+                    ui.heading("Camera");
+
+                    if ui.button("Reset Camera").clicked() {
+                        tracing::info!("Camera reset!");
+                    }
+
+                    // Calculate forward from the actual rotation quaternion
+                    let forward = camera_transform.rotation * Vec3::NEG_Z; // Rotate local -Z by camera rotation
+
+                    ui.small("Transform");
+
+                    ui.label(format!(
+                        "Position: ({:.2}, {:.2}, {:.2})",
+                        camera_transform.position.x,
+                        camera_transform.position.y,
+                        camera_transform.position.z
+                    ));
+                    ui.label(format!(
+                        "Rotation: ({:.2}, {:.2}, {:.2})",
+                        forward.x, forward.y, forward.z
+                    ));
+                });
+        });
+
+        self.egui_state
+            .get_mut()
+            .unwrap()
+            .handle_platform_output(&self.egui_window.get().unwrap(), ui.platform_output);
     }
 }
 
@@ -141,7 +259,6 @@ impl ApplicationHandler for App {
         event: winit::event::DeviceEvent,
     ) {
         if let winit::event::DeviceEvent::MouseMotion { delta } = event {
-            self.renderer().handle_egui_mouse_motion(delta);
             let mut input = self.world.resource_mut::<InputState>();
             if input.cursor_locked {
                 input.mouse_delta = (delta.0 as f32, delta.1 as f32);
@@ -152,35 +269,48 @@ impl ApplicationHandler for App {
     fn window_event(
         &mut self,
         event_loop: &winit::event_loop::ActiveEventLoop,
-        _window_id: winit::window::WindowId,
+        window_id: winit::window::WindowId,
         event: winit::event::WindowEvent,
     ) {
-        let Some(event) = self.renderer().handle_egui_event(event) else {
-            // egui handled the event
-            return;
-        };
+        if window_id == self.egui_window.get().unwrap().id() {
+            let res = self
+                .egui_state
+                .get_mut()
+                .unwrap()
+                .on_window_event(self.egui_window.get().as_ref().unwrap(), &event);
+            if res.repaint {
+                self.egui_window.get().unwrap().request_redraw();
+            }
+            if res.consumed {
+                return;
+            }
+        }
 
         match event {
             winit::event::WindowEvent::CloseRequested => {
                 event_loop.exit();
             }
             winit::event::WindowEvent::RedrawRequested => {
-                let (camera, cam_transform) = match self.camera_and_transform() {
-                    Ok((camera, transform)) => (camera.clone(), transform.clone()),
-                    Err(e) => {
-                        tracing::error!("Failed to get camera and transform: {}", e);
-                        return;
+                if window_id == self.renderer().window().id() {
+                    let (camera, cam_transform) = match self.camera_and_transform() {
+                        Ok((camera, transform)) => (camera.clone(), transform.clone()),
+                        Err(e) => {
+                            tracing::error!("Failed to get camera and transform: {}", e);
+                            return;
+                        }
+                    };
+
+                    self.world.resource_mut::<Time>().update();
+
+                    if let Err(e) = self.renderer().draw_frame(
+                        &cam_transform,
+                        &camera,
+                        &self.meshes_with_transforms(),
+                    ) {
+                        tracing::error!("Error: {e}")
                     }
-                };
-
-                self.world.resource_mut::<Time>().update();
-
-                if let Err(e) = self.renderer().draw_frame(
-                    &cam_transform,
-                    &camera,
-                    &self.meshes_with_transforms(),
-                ) {
-                    tracing::error!("Error: {e}")
+                } else if window_id == self.egui_window.get().unwrap().id() {
+                    self.draw_ui();
                 }
             }
             WindowEvent::KeyboardInput {
@@ -210,13 +340,6 @@ impl ApplicationHandler for App {
                         lock_cursor(&mut self.world);
                     }
                 }
-            }
-            WindowEvent::CursorMoved {
-                device_id,
-                position,
-            } => {
-                self.renderer()
-                    .handle_mouse_motion_diff((position.x, position.y));
             }
             _ => {}
         }
