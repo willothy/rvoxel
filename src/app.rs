@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use bevy_ecs::{intern::Interned, prelude::*, query::QuerySingleError, schedule::ScheduleLabel};
 use winit::{
     application::ApplicationHandler,
@@ -11,7 +13,7 @@ use crate::{
         mesh::Mesh,
         transform::Transform,
     },
-    renderer::vulkan::VulkanRenderer,
+    renderer::vulkan::{context::VkContext, VulkanRenderer},
     resources::{input::InputState, time::Time, window_handle::WindowHandle},
 };
 
@@ -22,14 +24,12 @@ pub struct App {
 
 impl App {
     pub fn new() -> anyhow::Result<Self> {
-        let entry = unsafe { ash::Entry::load()? };
-
         let mut world = World::new();
 
         world.insert_resource(crate::resources::time::Time::default());
         world.insert_resource(crate::resources::input::InputState::default());
 
-        let vk = VulkanRenderer::new(entry);
+        let vk = VulkanRenderer::new(Arc::new(VkContext::new()?));
         world.insert_resource(vk);
 
         let mut schedule = Schedule::default();

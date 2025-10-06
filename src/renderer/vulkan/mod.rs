@@ -7,7 +7,6 @@ use std::{
 use anyhow::Context;
 use ash::{khr::surface, vk};
 use bevy_ecs::prelude::*;
-use egui::LayerId;
 use glam::{Mat4, Vec3};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::Window;
@@ -23,64 +22,16 @@ use crate::{
     renderer::uniforms::UniformBufferObject,
 };
 
-unsafe extern "system" fn vulkan_debug_callback(
-    message_severity: vk::DebugUtilsMessageSeverityFlagsEXT,
-    message_type: vk::DebugUtilsMessageTypeFlagsEXT,
-    p_callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT,
-    _user_data: *mut std::ffi::c_void,
-) -> vk::Bool32 {
-    let message = unsafe {
-        let callback_data = *p_callback_data;
-        if callback_data.p_message.is_null() {
-            std::borrow::Cow::from("")
-        } else {
-            std::ffi::CStr::from_ptr(callback_data.p_message).to_string_lossy()
-        }
-    };
-
-    match message_severity {
-        vk::DebugUtilsMessageSeverityFlagsEXT::ERROR => {
-            eprintln!("🔴 VULKAN ERROR [{:?}]: {}", message_type, message);
-        }
-        vk::DebugUtilsMessageSeverityFlagsEXT::WARNING => {
-            eprintln!("🟡 VULKAN WARNING [{:?}]: {}", message_type, message);
-        }
-        vk::DebugUtilsMessageSeverityFlagsEXT::INFO => {
-            println!("🔵 VULKAN INFO [{:?}]: {}", message_type, message);
-        }
-        _ => {
-            println!("⚪ VULKAN [{:?}]: {}", message_type, message);
-        }
-    }
-
-    vk::FALSE
-}
+pub mod context;
 
 struct RendererInner {
+    ctx: Arc<context::VkContext>,
+
     /// The window that we are rendering to, from [`winit`].
     window: Arc<winit::window::Window>,
 
-    /// The Vulkan instance.
-    ///
-    /// TODO: figure out and explain what this really is
-    instance: ash::Instance,
-
-    /// Physical device represents a GPU in the system that we have
-    /// selected.
-    #[allow(unused)]
-    physical_device: ash::vk::PhysicalDevice,
-
-    /// The logical device is our connection to the physical device.
-    ///
-    /// You can think of it like a session between the application and the GPU driver.
-    device: ash::Device,
-
-    /// Queue for submitting graphics commands.
-    graphics_queue: ash::vk::Queue,
-
     /// The platform-specific window or display that we are rendering to.
     surface: ash::vk::SurfaceKHR,
-    surface_loader: surface::Instance,
 
     /// The swap chain is Vulkan's version of double buffering.
     ///
@@ -88,7 +39,7 @@ struct RendererInner {
     /// in Vulkan you manage 2-3 images and explicitly manage rendering to them and presenting
     /// them.
     swapchain: vk::SwapchainKHR,
-    swapchain_loader: ash::khr::swapchain::Device,
+
     /// The swapchain images.
     #[allow(unused)]
     swapchain_images: Vec<vk::Image>,
@@ -141,11 +92,6 @@ struct RendererInner {
     cube_vertex_buffer_memory: vk::DeviceMemory,
     cube_index_buffer: vk::Buffer,
     cube_index_buffer_memory: vk::DeviceMemory,
-
-    #[cfg(debug_assertions)]
-    debug_utils_loader: ash::ext::debug_utils::Instance,
-    #[cfg(debug_assertions)]
-    debug_messenger: vk::DebugUtilsMessengerEXT,
 }
 
 pub struct DebugState {
@@ -158,18 +104,18 @@ const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
 #[derive(Resource, Clone)]
 pub struct VulkanRenderer {
-    entry: ash::Entry,
+    vk: Arc<context::VkContext>,
 
-    vk: Arc<OnceLock<RendererInner>>,
+    inner: Arc<OnceLock<RendererInner>>,
 
     debug: Arc<DebugState>,
 }
 
 impl VulkanRenderer {
-    pub fn new(entry: ash::Entry) -> Self {
+    pub fn new(vk: Arc<context::VkContext>) -> Self {
         Self {
-            entry,
-            vk: Arc::new(OnceLock::new()),
+            vk,
+            inner: Arc::new(OnceLock::new()),
             debug: Arc::new(DebugState {
                 fps: RwLock::new(0.),
                 frame_time: RwLock::new(0.),
@@ -179,11 +125,11 @@ impl VulkanRenderer {
     }
 
     pub unsafe fn cleanup_vulkan(&self) {
-        unsafe { self.vk.get().unwrap().cleanup() };
+        unsafe { self.inner.get().unwrap().cleanup() };
     }
 
     pub fn window(&self) -> Arc<winit::window::Window> {
-        Arc::clone(&self.vk.get().unwrap().window)
+        Arc::clone(&self.inner.get().unwrap().window)
     }
 
     pub fn handle_egui_event(
@@ -214,7 +160,7 @@ impl VulkanRenderer {
         camera: &Camera,
         meshes: &[(&Mesh, &Transform)],
     ) -> anyhow::Result<()> {
-        let vk = self.vk.get().unwrap();
+        let vk = self.inner.get().unwrap();
 
         let ui = vk.draw_ui(|ctx| {
             egui::SidePanel::new(egui::panel::Side::Left, egui::Id::new("debug_ui_sidepanel"))
@@ -270,9 +216,9 @@ impl VulkanRenderer {
         &self,
         event_loop: &winit::event_loop::ActiveEventLoop,
     ) -> anyhow::Result<()> {
-        let renderer = RendererInner::new(&self.entry, event_loop)?;
+        let renderer = RendererInner::new(&self.vk, event_loop)?;
 
-        self.vk
+        self.inner
             .set(renderer)
             .map_err(|_| ())
             .expect("should only initialize once");
@@ -281,7 +227,7 @@ impl VulkanRenderer {
     }
 
     fn vk(&self) -> &RendererInner {
-        self.vk.get().expect("VulkanRenderer not initialized")
+        self.inner.get().expect("VulkanRenderer not initialized")
     }
 }
 
@@ -326,8 +272,11 @@ impl RendererInner {
         let current_frame = self.current_frame.load(std::sync::atomic::Ordering::SeqCst);
 
         unsafe {
-            self.device
-                .wait_for_fences(&[self.in_flight_fences[current_frame]], true, u64::MAX)?;
+            self.ctx.device.wait_for_fences(
+                &[self.in_flight_fences[current_frame]],
+                true,
+                u64::MAX,
+            )?;
         }
 
         // The current frame's fence is now signaled, so any image that was using this fence is now
@@ -341,7 +290,7 @@ impl RendererInner {
 
         // Get next image from swapchain
         let (image_index, _is_suboptimal) = unsafe {
-            self.swapchain_loader.acquire_next_image(
+            self.ctx.swapchain_loader.acquire_next_image(
                 self.swapchain,
                 u64::MAX,
                 // Signal this when ready
@@ -357,7 +306,9 @@ impl RendererInner {
             // Wait if this image is already in use by another frame
             if in_flight != vk::Fence::null() {
                 unsafe {
-                    self.device.wait_for_fences(&[in_flight], true, u64::MAX)?;
+                    self.ctx
+                        .device
+                        .wait_for_fences(&[in_flight], true, u64::MAX)?;
                 }
             }
         }
@@ -367,14 +318,15 @@ impl RendererInner {
 
         // Reset fence for next time (only after we know we're using this frame)
         unsafe {
-            self.device
+            self.ctx
+                .device
                 .reset_fences(&[self.in_flight_fences[current_frame]])?
         };
 
         unsafe { self.update_uniform_buffer(camera, camera_transform) };
 
         unsafe {
-            self.device.reset_command_buffer(
+            self.ctx.device.reset_command_buffer(
                 self.command_buffers[current_frame],
                 vk::CommandBufferResetFlags::empty(),
             )?
@@ -433,7 +385,8 @@ impl RendererInner {
 
         // Copy to GPU memory
         let data_ptr = unsafe {
-            self.device
+            self.ctx
+                .device
                 .map_memory(
                     self.uniform_buffers_memory[current_image],
                     0,
@@ -447,7 +400,8 @@ impl RendererInner {
         unsafe {
             std::ptr::copy_nonoverlapping(&ubo, data_ptr, 1);
 
-            self.device
+            self.ctx
+                .device
                 .unmap_memory(self.uniform_buffers_memory[current_image]);
         }
     }
@@ -455,92 +409,115 @@ impl RendererInner {
     pub unsafe fn cleanup(&self) {
         unsafe {
             // Wait for all GPU work to finish before destroying anything
-            self.device.device_wait_idle().unwrap();
+            self.ctx.device.device_wait_idle().unwrap();
 
             // Destroy synchronization objects (per-frame objects)
             for i in 0..MAX_FRAMES_IN_FLIGHT {
-                self.device
+                self.ctx
+                    .device
                     .destroy_semaphore(self.image_available_semaphores[i], None);
-                self.device.destroy_fence(self.in_flight_fences[i], None);
+                self.ctx
+                    .device
+                    .destroy_fence(self.in_flight_fences[i], None);
             }
 
             // Destroy per-swapchain-image semaphores
             for i in 0..self.swapchain_images.len() {
-                self.device
+                self.ctx
+                    .device
                     .destroy_semaphore(self.render_finished_semaphores[i], None);
             }
 
             // Destroy command pool (automatically frees command buffers)
-            self.device.destroy_command_pool(self.command_pool, None);
+            self.ctx
+                .device
+                .destroy_command_pool(self.command_pool, None);
 
             // Destroy cube shared buffers and memory
-            self.device.destroy_buffer(self.cube_vertex_buffer, None);
-            self.device
+            self.ctx
+                .device
+                .destroy_buffer(self.cube_vertex_buffer, None);
+            self.ctx
+                .device
                 .free_memory(self.cube_vertex_buffer_memory, None);
 
-            self.device.destroy_buffer(self.cube_index_buffer, None);
-            self.device.free_memory(self.cube_index_buffer_memory, None);
+            self.ctx.device.destroy_buffer(self.cube_index_buffer, None);
+            self.ctx
+                .device
+                .free_memory(self.cube_index_buffer_memory, None);
 
             // Cleaning up descriptor pool automatically frees descriptor sets
-            self.device
+            self.ctx
+                .device
                 .destroy_descriptor_pool(self.descriptor_pool, None);
-            self.device
+            self.ctx
+                .device
                 .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
 
             for i in 0..MAX_FRAMES_IN_FLIGHT {
-                self.device.destroy_buffer(self.uniform_buffers[i], None);
-                self.device
+                self.ctx
+                    .device
+                    .destroy_buffer(self.uniform_buffers[i], None);
+                self.ctx
+                    .device
                     .free_memory(self.uniform_buffers_memory[i], None);
             }
 
             // Destroy graphics pipeline and layout
-            self.device.destroy_pipeline(self.graphics_pipeline, None);
-            self.device
+            self.ctx
+                .device
+                .destroy_pipeline(self.graphics_pipeline, None);
+            self.ctx
+                .device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
 
             // Destroy framebuffers (one per swapchain image)
             for &framebuffer in &self.swapchain_framebuffers {
-                self.device.destroy_framebuffer(framebuffer, None);
+                self.ctx.device.destroy_framebuffer(framebuffer, None);
             }
 
             // Destroy image views (one per swapchain image)
             for &image_view in &self.swapchain_image_views {
-                self.device.destroy_image_view(image_view, None);
+                self.ctx.device.destroy_image_view(image_view, None);
             }
 
             // Destroy render pass
-            self.device.destroy_render_pass(self.render_pass, None);
+            self.ctx.device.destroy_render_pass(self.render_pass, None);
 
             // Destroy shader modules
-            self.device
+            self.ctx
+                .device
                 .destroy_shader_module(self.vert_shader_module, None);
-            self.device
+            self.ctx
+                .device
                 .destroy_shader_module(self.frag_shader_module, None);
 
             // Destroy swapchain (note: images are destroyed automatically)
-            self.swapchain_loader
+            self.ctx
+                .swapchain_loader
                 .destroy_swapchain(self.swapchain, None);
 
             // Destroy surface
-            self.surface_loader.destroy_surface(self.surface, None);
+            self.ctx.surface_loader.destroy_surface(self.surface, None);
 
             // Destroy egui renderer and state
             drop(self.egui_renderer.lock().take());
 
             // Destroy logical device
-            self.device.destroy_device(None);
+            self.ctx.device.destroy_device(None);
 
-            #[cfg(debug_assertions)]
-            self.debug_utils_loader
-                .destroy_debug_utils_messenger(self.debug_messenger, None);
+            #[cfg(all(debug_assertions, feature = "debug"))]
+            self.ctx
+                .debug_utils_loader
+                .destroy_debug_utils_messenger(self.ctx.debug_messenger, None);
 
             // Destroy instance (last!)
-            self.instance.destroy_instance(None);
+            self.ctx.instance.destroy_instance(None);
         }
     }
 
     pub fn new(
-        entry: &ash::Entry,
+        ctx: &Arc<context::VkContext>,
         ev: &winit::event_loop::ActiveEventLoop,
     ) -> anyhow::Result<Self> {
         let attrs = winit::window::Window::default_attributes()
@@ -561,55 +538,46 @@ impl RendererInner {
             None,
         );
 
-        let instance = unsafe { Self::create_instance(&entry, &window)? };
-
-        #[cfg(debug_assertions)]
-        let (debug_utils_loader, debug_messenger) =
-            unsafe { Self::setup_debug_messenger(entry, &instance)? };
-
-        let physical_device = unsafe { Self::pick_physical_device(&instance)? };
-
-        let (device, graphics_queue, queue_family) =
-            unsafe { Self::create_logical_device(&instance, &physical_device)? };
-
-        let (surface, surface_loader) = unsafe { Self::create_surface(entry, &instance, &window)? };
+        let surface = unsafe { Self::create_surface(&ctx.entry, &ctx.instance, &window)? };
 
         let (swapchain, swapchain_loader, surface_format, extent) = unsafe {
             Self::create_swap_chain(
-                &instance,
-                &physical_device,
-                &device,
+                &ctx.instance,
+                &ctx.physical_device,
+                &ctx.device,
                 &surface,
-                &surface_loader,
+                &ctx.surface_loader,
                 &window,
             )?
         };
         let swapchain_images = unsafe { swapchain_loader.get_swapchain_images(swapchain)? };
 
-        let command_pool = unsafe { Self::create_command_pool(&device, queue_family)? };
+        let command_pool =
+            unsafe { Self::create_command_pool(&ctx.device, ctx.graphics_queue_family_index)? };
 
-        let command_buffers = unsafe { Self::create_command_buffers(&device, &command_pool)? };
+        let command_buffers = unsafe { Self::create_command_buffers(&ctx.device, &command_pool)? };
 
         let (
             image_available_semaphores,
             render_finished_semaphores,
             in_flight_fences,
             images_in_flight,
-        ) = unsafe { Self::create_sync_objects(&device, swapchain_images.len())? };
+        ) = unsafe { Self::create_sync_objects(&ctx.device, swapchain_images.len())? };
 
         let (cube_vertex_buffer, cube_vertex_buffer_memory) =
-            Self::create_vertex_buffer(&device, &instance, physical_device)?;
+            Self::create_vertex_buffer(&ctx.device, &ctx.instance, ctx.physical_device)?;
 
         let (cube_index_buffer, cube_index_buffer_memory) =
-            unsafe { Self::create_index_buffer(&device, &instance, physical_device)? };
+            unsafe { Self::create_index_buffer(&ctx.device, &ctx.instance, ctx.physical_device)? };
 
-        let descriptor_set_layout = unsafe { Self::create_descriptor_set_layout(&device) };
-        let descriptor_pool = unsafe { Self::create_descriptor_pool(&device) };
-        let (uniform_buffers, uniform_buffers_memory) =
-            unsafe { Self::create_uniform_buffers(&device, &instance, physical_device)? };
+        let descriptor_set_layout = unsafe { Self::create_descriptor_set_layout(&ctx.device) };
+        let descriptor_pool = unsafe { Self::create_descriptor_pool(&ctx.device) };
+        let (uniform_buffers, uniform_buffers_memory) = unsafe {
+            Self::create_uniform_buffers(&ctx.device, &ctx.instance, ctx.physical_device)?
+        };
         let descriptor_sets = unsafe {
             Self::create_descriptor_sets(
-                &device,
+                &ctx.device,
                 descriptor_pool,
                 descriptor_set_layout,
                 &uniform_buffers,
@@ -617,16 +585,16 @@ impl RendererInner {
         };
 
         let vert_shader_module = unsafe {
-            Self::create_shader_module(&device, &super::shaders::compile_vertex_shader()?)?
+            Self::create_shader_module(&ctx.device, &super::shaders::compile_vertex_shader()?)?
         };
         let frag_shader_module = unsafe {
-            Self::create_shader_module(&device, &super::shaders::compile_fragment_shader()?)?
+            Self::create_shader_module(&ctx.device, &super::shaders::compile_fragment_shader()?)?
         };
 
-        let render_pass = unsafe { Self::create_render_pass(&device, surface_format.format)? };
+        let render_pass = unsafe { Self::create_render_pass(&ctx.device, surface_format.format)? };
 
         let (graphics_pipeline, pipeline_layout) = Self::create_graphics_pipeline(
-            &device,
+            &ctx.device,
             extent,
             render_pass,
             vert_shader_module,
@@ -636,7 +604,7 @@ impl RendererInner {
 
         let (swapchain_image_views, swapchain_framebuffers) = unsafe {
             Self::create_framebuffers(
-                &device,
+                &ctx.device,
                 &swapchain_images,
                 render_pass,
                 extent,
@@ -645,9 +613,9 @@ impl RendererInner {
         };
 
         let egui_renderer = egui_ash_renderer::Renderer::with_default_allocator(
-            &instance,
-            physical_device.clone(),
-            device.clone(),
+            &ctx.instance,
+            ctx.physical_device.clone(),
+            ctx.device.clone(),
             render_pass.clone(),
             egui_ash_renderer::Options {
                 in_flight_frames: MAX_FRAMES_IN_FLIGHT,
@@ -658,25 +626,16 @@ impl RendererInner {
         )?;
 
         Ok(Self {
-            #[cfg(debug_assertions)]
-            debug_utils_loader,
-            #[cfg(debug_assertions)]
-            debug_messenger,
+            ctx: Arc::clone(ctx),
 
             window: Arc::new(window),
-            instance,
-            physical_device,
-            device,
-            graphics_queue,
 
             surface,
-            surface_loader,
 
             swapchain,
             swapchain_format: surface_format.format,
             swapchain_extent: extent,
             swapchain_images,
-            swapchain_loader,
             swapchain_framebuffers,
             swapchain_image_views,
 
@@ -734,8 +693,8 @@ impl RendererInner {
             .signal_semaphores(&signal_semaphores); // Signal when rendering is done
 
         unsafe {
-            self.device.queue_submit(
-                self.graphics_queue,
+            self.ctx.device.queue_submit(
+                self.ctx.graphics_queue,
                 &[submit_info],
                 self.in_flight_fences[current_frame], // Signal fence when GPU work is done
             )?
@@ -755,8 +714,9 @@ impl RendererInner {
             .image_indices(&image_indices); // Which image in that swapchain
 
         unsafe {
-            self.swapchain_loader
-                .queue_present(self.graphics_queue, &present_info)?
+            self.ctx
+                .swapchain_loader
+                .queue_present(self.ctx.graphics_queue, &present_info)?
         };
 
         Ok(())
@@ -774,7 +734,8 @@ impl RendererInner {
         // Start recording
         let begin_info = vk::CommandBufferBeginInfo::default();
         unsafe {
-            self.device
+            self.ctx
+                .device
                 .begin_command_buffer(command_buffer, &begin_info)?
         };
 
@@ -795,7 +756,7 @@ impl RendererInner {
             .clear_values(&clear_values);
 
         unsafe {
-            self.device.cmd_begin_render_pass(
+            self.ctx.device.cmd_begin_render_pass(
                 command_buffer,
                 &render_pass_info,
                 vk::SubpassContents::INLINE, // We'll record commands directly (not secondary command buffers)
@@ -804,7 +765,7 @@ impl RendererInner {
 
         // Bind graphics pipeline
         unsafe {
-            self.device.cmd_bind_pipeline(
+            self.ctx.device.cmd_bind_pipeline(
                 command_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
                 self.graphics_pipeline,
@@ -815,17 +776,18 @@ impl RendererInner {
         let vertex_buffers = [self.cube_vertex_buffer];
         let offsets = [0];
         unsafe {
-            self.device
+            self.ctx
+                .device
                 .cmd_bind_vertex_buffers(command_buffer, 0, &vertex_buffers, &offsets);
 
-            self.device.cmd_bind_index_buffer(
+            self.ctx.device.cmd_bind_index_buffer(
                 command_buffer,
                 self.cube_index_buffer,
                 0,
                 vk::IndexType::UINT16,
             );
 
-            self.device.cmd_bind_descriptor_sets(
+            self.ctx.device.cmd_bind_descriptor_sets(
                 command_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
                 self.pipeline_layout,
@@ -837,7 +799,7 @@ impl RendererInner {
             for (_mesh, transform) in meshes {
                 let model = [transform.matrix()];
 
-                self.device.cmd_push_constants(
+                self.ctx.device.cmd_push_constants(
                     command_buffer,
                     self.pipeline_layout,
                     vk::ShaderStageFlags::VERTEX,
@@ -845,7 +807,7 @@ impl RendererInner {
                     bytemuck::cast_slice(&model),
                 );
 
-                self.device.cmd_draw_indexed(
+                self.ctx.device.cmd_draw_indexed(
                     command_buffer,
                     crate::shapes::CUBE_INDICES.len() as u32,
                     1,
@@ -868,7 +830,7 @@ impl RendererInner {
             let renderer = renderer_guard.as_mut().unwrap();
 
             renderer.set_textures(
-                self.graphics_queue,
+                self.ctx.graphics_queue,
                 self.command_pool,
                 &output.textures_delta.set,
             )?;
@@ -881,17 +843,16 @@ impl RendererInner {
                 },
                 output.pixels_per_point,
                 &clipped_primitives,
-                // &output.textures_delta,
             ) {
                 tracing::error!("Failed to render egui: {}", e);
             }
         }
 
         // End render pass
-        unsafe { self.device.cmd_end_render_pass(command_buffer) };
+        unsafe { self.ctx.device.cmd_end_render_pass(command_buffer) };
 
         // Finish recording
-        unsafe { self.device.end_command_buffer(command_buffer)? };
+        unsafe { self.ctx.device.end_command_buffer(command_buffer)? };
 
         Ok(())
     }
@@ -1271,7 +1232,7 @@ impl RendererInner {
         entry: &ash::Entry,
         instance: &ash::Instance,
         window: &Window,
-    ) -> anyhow::Result<(ash::vk::SurfaceKHR, surface::Instance)> {
+    ) -> anyhow::Result<ash::vk::SurfaceKHR> {
         let surface = unsafe {
             ash_window::create_surface(
                 entry,
@@ -1282,157 +1243,7 @@ impl RendererInner {
             )?
         };
 
-        let surface_loader = surface::Instance::new(entry, &instance);
-
-        Ok((surface, surface_loader))
-    }
-
-    unsafe fn pick_physical_device(
-        instance: &ash::Instance,
-    ) -> anyhow::Result<ash::vk::PhysicalDevice> {
-        let physical_devices = unsafe { instance.enumerate_physical_devices()? };
-
-        let mut discrete = None;
-        let mut integrated = None;
-        let mut first = None;
-
-        for pd in &physical_devices {
-            first = first.or_else(|| Some(pd));
-
-            let props = unsafe { instance.get_physical_device_properties(pd.clone()) };
-            if props.device_type == ash::vk::PhysicalDeviceType::DISCRETE_GPU {
-                discrete = discrete.or_else(|| Some(pd));
-                continue;
-            }
-            if props.device_type == ash::vk::PhysicalDeviceType::INTEGRATED_GPU {
-                integrated = integrated.or_else(|| Some(pd));
-                continue;
-            }
-        }
-
-        discrete
-            .or(integrated)
-            .or(first)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("No suitable physical device found"))
-    }
-
-    unsafe fn create_logical_device(
-        instance: &ash::Instance,
-        physical_device: &ash::vk::PhysicalDevice,
-    ) -> anyhow::Result<(ash::Device, ash::vk::Queue, u32)> {
-        // TODO: combine this and pick_physical_device to actually find the device that
-        // supports the most features we want.
-
-        let queue_family_properties = unsafe {
-            instance.get_physical_device_queue_family_properties(physical_device.clone())
-        };
-
-        // Find a graphics queue family
-        let graphics_queue_family_index = queue_family_properties
-            .iter()
-            .position(|info| info.queue_flags.contains(ash::vk::QueueFlags::GRAPHICS))
-            .map(|i| i as u32)
-            .ok_or_else(|| anyhow::anyhow!("No suitable queue family found"))?;
-
-        // Request queues from that graphics queue family
-        let queue_create_info = ash::vk::DeviceQueueCreateInfo::default()
-            .queue_family_index(graphics_queue_family_index)
-            .queue_priorities(&[1.0]);
-
-        // .fill_mode_non_solid(true)
-        let features = ash::vk::PhysicalDeviceFeatures::default();
-
-        let device_extension_names = [
-            // enables swapchain
-            ash::khr::swapchain::NAME.as_ptr(),
-        ];
-
-        let device_create_info = ash::vk::DeviceCreateInfo::default()
-            .enabled_features(&features)
-            .enabled_extension_names(&device_extension_names)
-            .queue_create_infos(std::slice::from_ref(&queue_create_info));
-
-        // Create the device
-        //
-        // A Device (different from PhysicalDevice) is a logical connection to the physical device,
-        // like a session.
-        let device =
-            unsafe { instance.create_device(physical_device.clone(), &device_create_info, None)? };
-
-        let graphics_queue = unsafe { device.get_device_queue(graphics_queue_family_index, 0) };
-
-        Ok((device, graphics_queue, graphics_queue_family_index))
-    }
-
-    #[cfg(debug_assertions)]
-    unsafe fn setup_debug_messenger(
-        entry: &ash::Entry,
-        instance: &ash::Instance,
-    ) -> anyhow::Result<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)> {
-        let debug_utils_loader = ash::ext::debug_utils::Instance::new(entry, instance);
-
-        let debug_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
-            .message_severity(
-                vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
-                    | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
-                    | vk::DebugUtilsMessageSeverityFlagsEXT::INFO,
-            )
-            .message_type(
-                vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
-                    | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
-                    | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
-            )
-            .pfn_user_callback(Some(vulkan_debug_callback));
-
-        let debug_messenger = unsafe {
-            debug_utils_loader
-                .create_debug_utils_messenger(&debug_info, None)
-                .context("Failed to create debug messenger")?
-        };
-
-        Ok((debug_utils_loader, debug_messenger))
-    }
-
-    unsafe fn create_instance(
-        entry: &ash::Entry,
-        window: &Window,
-    ) -> anyhow::Result<ash::Instance> {
-        let app_info = ash::vk::ApplicationInfo::default()
-            .application_name(std::ffi::CStr::from_bytes_with_nul(b"rvoxel\0")?)
-            .application_version(ash::vk::make_api_version(0, 1, 0, 0))
-            .engine_name(std::ffi::CStr::from_bytes_with_nul(b"No Engine\0")?)
-            .engine_version(ash::vk::make_api_version(0, 1, 0, 0))
-            .api_version(ash::vk::API_VERSION_1_0);
-
-        let mut extension_names =
-            ash_window::enumerate_required_extensions(window.display_handle()?.into())?.to_vec();
-
-        extension_names.extend([
-            vk::KHR_PORTABILITY_ENUMERATION_NAME.as_ptr(),
-            #[cfg(debug_assertions)]
-            vk::EXT_DEBUG_UTILS_NAME.as_ptr(),
-            // #[cfg(debug_assertions)]
-            // vk::EXT_VALIDATION_FEATURES_NAME.as_ptr(),
-            // vk::EXT_VALIDATION_FLAGS_NAME.as_ptr(),
-        ]);
-
-        let mut flags = ash::vk::InstanceCreateFlags::default();
-
-        flags |= ash::vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
-
-        let layer_names = [
-            #[cfg(debug_assertions)]
-            ("VK_LAYER_KHRONOS_validation\0".as_ptr() as *const i8),
-        ];
-
-        let create_info = ash::vk::InstanceCreateInfo::default()
-            .application_info(&app_info)
-            .enabled_layer_names(&layer_names)
-            .enabled_extension_names(&extension_names)
-            .flags(flags);
-
-        Ok(unsafe { entry.create_instance(&create_info, None)? })
+        Ok(surface)
     }
 
     unsafe fn create_command_pool(
