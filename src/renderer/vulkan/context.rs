@@ -102,7 +102,18 @@ impl VkContext {
             .api_version(ash::vk::API_VERSION_1_0);
 
         let extension_names = vec![
+            // Surface and swapchain functionality
+            vk::KHR_SURFACE_NAME.as_ptr(),
+            //
+            // OS support
+            #[cfg(target_os = "macos")]
             vk::KHR_PORTABILITY_ENUMERATION_NAME.as_ptr(),
+            #[cfg(target_os = "linux")]
+            vk::KHR_WAYLAND_SURFACE_NAME.as_ptr(),
+            #[cfg(target_os = "linux")]
+            vk::KHR_XCB_SURFACE_NAME.as_ptr(),
+            //
+            // Debug utils
             #[cfg(all(debug_assertions, feature = "debug"))]
             vk::EXT_DEBUG_UTILS_NAME.as_ptr(),
         ];
