@@ -502,17 +502,6 @@ impl RendererInner {
 
             // Destroy egui renderer and state
             drop(self.egui_renderer.lock().take());
-
-            // Destroy logical device
-            self.ctx.device.destroy_device(None);
-
-            #[cfg(all(debug_assertions, feature = "debug"))]
-            self.ctx
-                .debug_utils_loader
-                .destroy_debug_utils_messenger(self.ctx.debug_messenger, None);
-
-            // Destroy instance (last!)
-            self.ctx.instance.destroy_instance(None);
         }
     }
 

@@ -35,6 +35,25 @@ pub struct VkContext {
     pub(crate) debug_messenger: vk::DebugUtilsMessengerEXT,
 }
 
+impl Drop for VkContext {
+    fn drop(&mut self) {
+        unsafe {
+            if let Err(_) = self.device.device_wait_idle() {
+                tracing::warn!("Failed to wait for device idle");
+            }
+
+            self.device.destroy_device(None);
+
+            #[cfg(all(debug_assertions, feature = "debug"))]
+            self.ctx
+                .debug_utils_loader
+                .destroy_debug_utils_messenger(self.ctx.debug_messenger, None);
+
+            self.instance.destroy_instance(None);
+        }
+    }
+}
+
 impl VkContext {
     pub fn new() -> anyhow::Result<Self> {
         unsafe {
