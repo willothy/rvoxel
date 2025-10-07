@@ -201,6 +201,9 @@ impl ApplicationHandler for App {
 
         // self.world.run_schedule(self.schedule);
         self.world.resource_mut::<InputState>().reset_frame();
+
+        self.renderer().window().request_redraw();
+        self.debug_window.window().request_redraw();
     }
 
     fn device_event(
