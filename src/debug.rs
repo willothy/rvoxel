@@ -7,31 +7,34 @@ use winit::event_loop::ActiveEventLoop;
 
 use crate::renderer::vulkan::context::VkContext;
 
-pub struct DebugWindow {
-    vk_ctx: Arc<VkContext>,
+struct DebugWindowInner {
+    window: Arc<winit::window::Window>,
+    state: egui_winit::State,
 
-    ctx: egui::Context,
-    state: OnceCell<egui_winit::State>,
-    window: OnceCell<Arc<winit::window::Window>>,
+    surface: vk::SurfaceKHR,
+    swapchain: vk::SwapchainKHR,
+    swapchain_images: Vec<vk::Image>,
+    swapchain_image_views: Vec<vk::ImageView>,
+    swapchain_extent: vk::Extent2D,
+    swapchain_format: vk::Format,
 
-    surface: OnceCell<vk::SurfaceKHR>,
-    swapchain: OnceCell<vk::SwapchainKHR>,
-    swapchain_images: OnceCell<Vec<vk::Image>>,
-    swapchain_image_views: OnceCell<Vec<vk::ImageView>>,
-    swapchain_extent: OnceCell<vk::Extent2D>,
-    swapchain_format: OnceCell<vk::Format>,
+    render_pass: vk::RenderPass,
+    framebuffers: Vec<vk::Framebuffer>,
 
-    render_pass: OnceCell<vk::RenderPass>,
-    framebuffers: OnceCell<Vec<vk::Framebuffer>>,
+    command_pool: vk::CommandPool,
+    command_buffers: Vec<vk::CommandBuffer>,
 
-    command_pool: OnceCell<vk::CommandPool>,
-    command_buffers: OnceCell<Vec<vk::CommandBuffer>>,
-
-    image_available_semaphores: OnceCell<Vec<vk::Semaphore>>,
-    render_finished_semaphores: OnceCell<Vec<vk::Semaphore>>,
+    image_available_semaphores: Vec<vk::Semaphore>,
+    render_finished_semaphores: Vec<vk::Semaphore>,
     current_frame: std::sync::atomic::AtomicUsize,
 
-    renderer: OnceCell<egui_ash_renderer::Renderer>,
+    renderer: egui_ash_renderer::Renderer,
+}
+
+pub struct DebugWindow {
+    vk_ctx: Arc<VkContext>,
+    ctx: egui::Context,
+    inner: OnceCell<DebugWindowInner>,
 }
 
 impl DebugWindow {
@@ -39,22 +42,7 @@ impl DebugWindow {
         Self {
             vk_ctx,
             ctx: egui::Context::default(),
-            state: OnceCell::new(),
-            window: OnceCell::new(),
-            surface: OnceCell::new(),
-            swapchain: OnceCell::new(),
-            swapchain_images: OnceCell::new(),
-            swapchain_image_views: OnceCell::new(),
-            swapchain_extent: OnceCell::new(),
-            swapchain_format: OnceCell::new(),
-            render_pass: OnceCell::new(),
-            framebuffers: OnceCell::new(),
-            command_pool: OnceCell::new(),
-            command_buffers: OnceCell::new(),
-            image_available_semaphores: OnceCell::new(),
-            render_finished_semaphores: OnceCell::new(),
-            current_frame: std::sync::atomic::AtomicUsize::new(0),
-            renderer: OnceCell::new(),
+            inner: OnceCell::new(),
         }
     }
 
@@ -127,64 +115,27 @@ impl DebugWindow {
             None,
         );
 
-        self.state
-            .set(state)
-            .map_err(|_| ())
-            .expect("should only be initialized once");
-        self.window
-            .set(window)
-            .map_err(|_| ())
-            .expect("should only be initialized once");
-        self.surface
-            .set(surface)
-            .map_err(|_| ())
-            .expect("should only be initialized once");
-        self.swapchain
-            .set(swapchain)
-            .map_err(|_| ())
-            .expect("should only be initialized once");
-        self.swapchain_images
-            .set(swapchain_images)
-            .map_err(|_| ())
-            .expect("should only be initialized once");
-        self.swapchain_image_views
-            .set(image_views)
-            .map_err(|_| ())
-            .expect("should only be initialized once");
-        self.swapchain_extent
-            .set(extent)
-            .map_err(|_| ())
-            .expect("should only be initialized once");
-        self.swapchain_format
-            .set(surface_format.format)
-            .map_err(|_| ())
-            .expect("should only be initialized once");
-        self.render_pass
-            .set(render_pass)
-            .map_err(|_| ())
-            .expect("should only be initialized once");
-        self.framebuffers
-            .set(framebuffers)
-            .map_err(|_| ())
-            .expect("should only be initialized once");
-        self.command_pool
-            .set(command_pool)
-            .map_err(|_| ())
-            .expect("should only be initialized once");
-        self.command_buffers
-            .set(command_buffers)
-            .map_err(|_| ())
-            .expect("should only be initialized once");
-        self.image_available_semaphores
-            .set(image_available_semaphores)
-            .map_err(|_| ())
-            .expect("should only be initialized once");
-        self.render_finished_semaphores
-            .set(render_finished_semaphores)
-            .map_err(|_| ())
-            .expect("should only be initialized once");
-        self.renderer
-            .set(renderer)
+        let inner = DebugWindowInner {
+            window,
+            state,
+            surface,
+            swapchain,
+            swapchain_images,
+            swapchain_image_views: image_views,
+            swapchain_extent: extent,
+            swapchain_format: surface_format.format,
+            render_pass,
+            framebuffers,
+            command_pool,
+            command_buffers,
+            image_available_semaphores,
+            render_finished_semaphores,
+            current_frame: std::sync::atomic::AtomicUsize::new(0),
+            renderer,
+        };
+
+        self.inner
+            .set(inner)
             .map_err(|_| ())
             .expect("should only be initialized once");
 
@@ -385,15 +336,7 @@ impl DebugWindow {
     }
 
     pub fn window(&self) -> &Arc<winit::window::Window> {
-        self.window.get().expect("DebugWindow not initialized")
-    }
-
-    pub fn state(&self) -> &egui_winit::State {
-        self.state.get().expect("DebugWindow not initialized")
-    }
-
-    pub fn state_mut(&mut self) -> &mut egui_winit::State {
-        self.state.get_mut().expect("DebugWindow not initialized")
+        &self.inner.get().expect("DebugWindow not initialized").window
     }
 
     pub fn ctx(&self) -> &egui::Context {
@@ -401,39 +344,17 @@ impl DebugWindow {
     }
 
     pub fn draw(&mut self, draw_fn: impl FnMut(&egui::Context)) -> egui::FullOutput {
-        let win = Arc::clone(self.window());
-
-        let input = self.state_mut().take_egui_input(win.as_ref());
-
+        let inner = self.inner.get_mut().expect("DebugWindow not initialized");
+        let input = inner.state.take_egui_input(inner.window.as_ref());
         let output = self.ctx.run(input, draw_fn);
-
-        self.state_mut()
-            .handle_platform_output(win.as_ref(), output.platform_output.clone());
-
+        inner.state.handle_platform_output(inner.window.as_ref(), output.platform_output.clone());
         output
     }
 
     pub unsafe fn render(&mut self, draw_fn: impl FnMut(&egui::Context)) -> anyhow::Result<()> {
         let output = self.draw(draw_fn);
+        let inner = self.inner.get_mut().expect("DebugWindow not initialized");
 
-        let renderer = self.renderer.get_mut().expect("Renderer not initialized");
-        let command_pool = *self
-            .command_pool
-            .get()
-            .expect("Command pool not initialized");
-        let command_buffer = self
-            .command_buffers
-            .get()
-            .expect("Command buffers not initialized")[0];
-        let swapchain = *self.swapchain.get().expect("Swapchain not initialized");
-        let extent = *self.swapchain_extent.get().expect("Extent not initialized");
-        let framebuffers = self
-            .framebuffers
-            .get()
-            .expect("Framebuffers not initialized");
-        let render_pass = *self.render_pass.get().expect("Render pass not initialized");
-
-        // Update textures
         let textures_to_set: Vec<_> = output
             .textures_delta
             .set
@@ -442,27 +363,26 @@ impl DebugWindow {
             .collect();
 
         if !textures_to_set.is_empty() {
-            renderer.set_textures(self.vk_ctx.graphics_queue, command_pool, &textures_to_set)?;
+            inner.renderer.set_textures(self.vk_ctx.graphics_queue, inner.command_pool, &textures_to_set)?;
         }
 
-        let current_frame = self.current_frame.load(std::sync::atomic::Ordering::SeqCst);
-        let image_available_semaphores = self.image_available_semaphores.get().expect("Semaphores not initialized");
-        let render_finished_semaphores = self.render_finished_semaphores.get().expect("Semaphores not initialized");
+        let current_frame = inner.current_frame.load(std::sync::atomic::Ordering::SeqCst);
 
         let (image_index, _) = unsafe {
             self.vk_ctx.swapchain_loader.acquire_next_image(
-                swapchain,
+                inner.swapchain,
                 u64::MAX,
-                image_available_semaphores[current_frame],
+                inner.image_available_semaphores[current_frame],
                 vk::Fence::null(),
             )?
         };
 
-        let image_available_semaphore = image_available_semaphores[current_frame];
-        let render_finished_semaphore = render_finished_semaphores[current_frame];
+        let image_available_semaphore = inner.image_available_semaphores[current_frame];
+        let render_finished_semaphore = inner.render_finished_semaphores[current_frame];
 
-        // Reset and begin command buffer
         unsafe {
+            let command_buffer = inner.command_buffers[0];
+
             self.vk_ctx
                 .device
                 .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())?;
@@ -474,7 +394,6 @@ impl DebugWindow {
                 .device
                 .begin_command_buffer(command_buffer, &begin_info)?;
 
-            // Begin render pass
             let clear_value = vk::ClearValue {
                 color: vk::ClearColorValue {
                     float32: [0.1, 0.1, 0.1, 1.0],
@@ -482,11 +401,11 @@ impl DebugWindow {
             };
 
             let render_pass_begin = vk::RenderPassBeginInfo::default()
-                .render_pass(render_pass)
-                .framebuffer(framebuffers[image_index as usize])
+                .render_pass(inner.render_pass)
+                .framebuffer(inner.framebuffers[image_index as usize])
                 .render_area(vk::Rect2D {
                     offset: vk::Offset2D { x: 0, y: 0 },
-                    extent,
+                    extent: inner.swapchain_extent,
                 })
                 .clear_values(std::slice::from_ref(&clear_value));
 
@@ -496,11 +415,10 @@ impl DebugWindow {
                 vk::SubpassContents::INLINE,
             );
 
-            // Render egui
-            renderer.cmd_draw(
+            inner.renderer.cmd_draw(
                 command_buffer,
-                extent,
-                1.0, // pixels_per_point
+                inner.swapchain_extent,
+                1.0,
                 &self.ctx.tessellate(output.shapes, output.pixels_per_point),
             )?;
 
@@ -528,11 +446,10 @@ impl DebugWindow {
                 .device
                 .queue_wait_idle(self.vk_ctx.graphics_queue)?;
 
-            // Present
             let wait_semaphores = [render_finished_semaphore];
             let present_info = vk::PresentInfoKHR::default()
                 .wait_semaphores(&wait_semaphores)
-                .swapchains(std::slice::from_ref(&swapchain))
+                .swapchains(std::slice::from_ref(&inner.swapchain))
                 .image_indices(std::slice::from_ref(&image_index));
 
             self.vk_ctx
@@ -540,13 +457,12 @@ impl DebugWindow {
                 .queue_present(self.vk_ctx.graphics_queue, &present_info)?;
         }
 
-        // Free textures
         if !output.textures_delta.free.is_empty() {
-            renderer.free_textures(&output.textures_delta.free)?;
+            inner.renderer.free_textures(&output.textures_delta.free)?;
         }
 
-        self.current_frame.store(
-            (current_frame + 1) % image_available_semaphores.len(),
+        inner.current_frame.store(
+            (current_frame + 1) % inner.image_available_semaphores.len(),
             std::sync::atomic::Ordering::SeqCst,
         );
 
@@ -554,65 +470,43 @@ impl DebugWindow {
     }
 
     pub fn handle_event(&mut self, event: &winit::event::WindowEvent) -> egui_winit::EventResponse {
-        let win = Arc::clone(&self.window());
-
-        self.state_mut().on_window_event(win.as_ref(), event)
+        let inner = self.inner.get_mut().expect("DebugWindow not initialized");
+        inner.state.on_window_event(inner.window.as_ref(), event)
     }
 
     pub unsafe fn cleanup(&mut self) {
-        unsafe {
-            self.vk_ctx.device.device_wait_idle().ok();
+        if let Some(inner) = self.inner.take() {
+            unsafe {
+                self.vk_ctx.device.device_wait_idle().ok();
 
-            // IMPORTANT: Destroy renderer first (it has its own Vulkan resources)
-            // Drop will be called automatically when renderer goes out of scope
-            drop(self.renderer.take());
+                // Destroy renderer first (owns Vulkan resources)
+                drop(inner.renderer);
 
-            if let Some(semaphores) = self.image_available_semaphores.get() {
-                for &semaphore in semaphores {
+                for &semaphore in &inner.image_available_semaphores {
                     self.vk_ctx.device.destroy_semaphore(semaphore, None);
                 }
-            }
 
-            if let Some(semaphores) = self.render_finished_semaphores.get() {
-                for &semaphore in semaphores {
+                for &semaphore in &inner.render_finished_semaphores {
                     self.vk_ctx.device.destroy_semaphore(semaphore, None);
                 }
-            }
 
-            // Destroy command pool (automatically frees command buffers)
-            if let Some(command_pool) = self.command_pool.get() {
-                self.vk_ctx.device.destroy_command_pool(*command_pool, None);
-            }
+                self.vk_ctx.device.destroy_command_pool(inner.command_pool, None);
 
-            // Destroy framebuffers
-            if let Some(framebuffers) = self.framebuffers.get() {
-                for &fb in framebuffers {
+                for &fb in &inner.framebuffers {
                     self.vk_ctx.device.destroy_framebuffer(fb, None);
                 }
-            }
 
-            // Destroy image views
-            if let Some(image_views) = self.swapchain_image_views.get() {
-                for &view in image_views {
+                for &view in &inner.swapchain_image_views {
                     self.vk_ctx.device.destroy_image_view(view, None);
                 }
-            }
 
-            // Destroy render pass
-            if let Some(render_pass) = self.render_pass.get() {
-                self.vk_ctx.device.destroy_render_pass(*render_pass, None);
-            }
+                self.vk_ctx.device.destroy_render_pass(inner.render_pass, None);
 
-            // Destroy swapchain
-            if let Some(swapchain) = self.swapchain.get() {
                 self.vk_ctx
                     .swapchain_loader
-                    .destroy_swapchain(*swapchain, None);
-            }
+                    .destroy_swapchain(inner.swapchain, None);
 
-            // Destroy surface
-            if let Some(surface) = self.surface.get() {
-                self.vk_ctx.surface_loader.destroy_surface(*surface, None);
+                self.vk_ctx.surface_loader.destroy_surface(inner.surface, None);
             }
         }
     }
