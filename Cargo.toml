@@ -3,6 +3,10 @@ name = "rvoxel"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default-features = ["debug"]
+debug = []
+
 [dependencies]
 anyhow = { version = "1.0.99", features = ["backtrace"] }
 ash = { version = "0.38.0", features = ["debug"] }
