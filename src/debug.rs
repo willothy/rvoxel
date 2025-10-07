@@ -65,8 +65,13 @@ impl DebugWindow {
         };
 
         // Create swapchain (reuse logic from main renderer)
-        let (swapchain, surface_format, extent) =
-            unsafe { self.create_swapchain(&surface, &window)? };
+        let (swapchain, surface_format, extent) = unsafe {
+            self.create_swapchain(&surface, &window)?
+        };
+
+        let actual_window_size = window.inner_size();
+        tracing::debug!("Debug window: after swapchain creation - window inner_size={:?}, swapchain extent={:?}",
+            actual_window_size, extent);
 
         let swapchain_images = unsafe {
             self.vk_ctx
@@ -110,7 +115,7 @@ impl DebugWindow {
             self.ctx.clone(),
             self.ctx.viewport_id(),
             window.as_ref(),
-            None,
+            Some(window.scale_factor() as f32),
             None,
             None,
         );
@@ -165,6 +170,7 @@ impl DebugWindow {
             capabilities.current_extent
         } else {
             let window_size = window.inner_size();
+
             vk::Extent2D {
                 width: window_size.width.clamp(
                     capabilities.min_image_extent.width,
@@ -176,6 +182,8 @@ impl DebugWindow {
                 ),
             }
         };
+
+        tracing::debug!("Debug window: final extent={:?}", extent);
 
         let image_count =
             (capabilities.min_image_count + 1).min(if capabilities.max_image_count > 0 {
@@ -346,6 +354,13 @@ impl DebugWindow {
     pub fn draw(&mut self, draw_fn: impl FnMut(&egui::Context)) -> egui::FullOutput {
         let inner = self.inner.get_mut().expect("DebugWindow not initialized");
         let input = inner.state.take_egui_input(inner.window.as_ref());
+
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::debug!("Debug window egui: screen_rect={:?}, viewport={:?}",
+                input.screen_rect, input.viewports.get(&input.viewport_id));
+        });
+
         let output = self.ctx.run(input, draw_fn);
         inner.state.handle_platform_output(inner.window.as_ref(), output.platform_output.clone());
         output
@@ -418,7 +433,7 @@ impl DebugWindow {
             inner.renderer.cmd_draw(
                 command_buffer,
                 inner.swapchain_extent,
-                1.0,
+                output.pixels_per_point,
                 &self.ctx.tessellate(output.shapes, output.pixels_per_point),
             )?;
 
@@ -470,8 +485,66 @@ impl DebugWindow {
     }
 
     pub fn handle_event(&mut self, event: &winit::event::WindowEvent) -> egui_winit::EventResponse {
+        if let winit::event::WindowEvent::Resized(new_size) = event {
+            if new_size.width > 0 && new_size.height > 0 {
+                tracing::debug!("Debug window resized to {:?}", new_size);
+                unsafe {
+                    if let Err(e) = self.recreate_swapchain() {
+                        tracing::error!("Failed to recreate swapchain: {}", e);
+                    }
+                }
+            }
+        }
+
         let inner = self.inner.get_mut().expect("DebugWindow not initialized");
         inner.state.on_window_event(inner.window.as_ref(), event)
+    }
+
+    unsafe fn recreate_swapchain(&mut self) -> anyhow::Result<()> {
+        unsafe {
+            self.vk_ctx.device.device_wait_idle()?;
+
+            let inner = self.inner.get_mut().expect("DebugWindow not initialized");
+
+            for &fb in &inner.framebuffers {
+                self.vk_ctx.device.destroy_framebuffer(fb, None);
+            }
+
+            for &view in &inner.swapchain_image_views {
+                self.vk_ctx.device.destroy_image_view(view, None);
+            }
+
+            self.vk_ctx.swapchain_loader.destroy_swapchain(inner.swapchain, None);
+
+            let surface = inner.surface;
+            let window = Arc::clone(&inner.window);
+            let render_pass = inner.render_pass;
+
+            drop(inner);
+
+            let (swapchain, surface_format, extent) = self.create_swapchain(&surface, &window)?;
+
+            let swapchain_images = self.vk_ctx.swapchain_loader.get_swapchain_images(swapchain)?;
+
+            let (image_views, framebuffers) = self.create_framebuffers(
+                &swapchain_images,
+                render_pass,
+                extent,
+                surface_format.format,
+            )?;
+
+            let inner = self.inner.get_mut().expect("DebugWindow not initialized");
+            inner.swapchain = swapchain;
+            inner.swapchain_images = swapchain_images;
+            inner.swapchain_image_views = image_views;
+            inner.swapchain_extent = extent;
+            inner.swapchain_format = surface_format.format;
+            inner.framebuffers = framebuffers;
+
+            tracing::debug!("Debug window swapchain recreated with extent {:?}", extent);
+        }
+
+        Ok(())
     }
 
     pub unsafe fn cleanup(&mut self) {

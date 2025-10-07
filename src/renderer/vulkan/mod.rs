@@ -475,6 +475,10 @@ impl RendererInner {
                 &window,
             )?
         };
+
+        let actual_window_size = window.inner_size();
+        tracing::debug!("Main window: after swapchain creation - window inner_size={:?}, swapchain extent={:?}",
+            actual_window_size, extent);
         let swapchain_images = unsafe { swapchain_loader.get_swapchain_images(swapchain)? };
 
         let command_pool =
@@ -800,12 +804,15 @@ impl RendererInner {
 
         let swapchain_device = ash::khr::swapchain::Device::new(&instance, &device);
 
+        let window_size = window.inner_size();
+        tracing::debug!("Main window: inner_size={:?}, scale_factor={}", window_size, window.scale_factor());
+        tracing::debug!("Main window: capabilities.current_extent={:?}", capabilities.current_extent);
+
         let extent = if capabilities.current_extent.width != u32::MAX {
             // Surface tells us exactly what size to use
             capabilities.current_extent
         } else {
             // We need to figure out the size from the window
-            let window_size = window.inner_size();
 
             vk::Extent2D {
                 width: window_size.width.clamp(
@@ -818,6 +825,8 @@ impl RendererInner {
                 ),
             }
         };
+
+        tracing::debug!("Main window: final extent={:?}", extent);
 
         let info = vk::SwapchainCreateInfoKHR::default()
             .surface(surface.clone())
