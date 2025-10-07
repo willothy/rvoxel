@@ -179,6 +179,11 @@ impl VulkanRenderer {
         Ok(())
     }
 
+    pub unsafe fn recreate_swapchain(&self) -> anyhow::Result<()> {
+        let vk = self.vk();
+        unsafe { vk.recreate_swapchain(&self.vk) }
+    }
+
     fn vk(&self) -> &RendererInner {
         self.inner.get().expect("VulkanRenderer not initialized")
     }
@@ -351,6 +356,53 @@ impl RendererInner {
                 .device
                 .unmap_memory(self.uniform_buffers_memory[current_image]);
         }
+    }
+
+    unsafe fn recreate_swapchain(&self, ctx: &Arc<context::VkContext>) -> anyhow::Result<()> {
+        unsafe {
+            self.ctx.device.device_wait_idle()?;
+
+            for &fb in &self.swapchain_framebuffers {
+                self.ctx.device.destroy_framebuffer(fb, None);
+            }
+
+            for &view in &self.swapchain_image_views {
+                self.ctx.device.destroy_image_view(view, None);
+            }
+
+            ctx.swapchain_loader.destroy_swapchain(self.swapchain, None);
+
+            let (swapchain, _, surface_format, extent) = Self::create_swap_chain(
+                &ctx.instance,
+                &ctx.physical_device,
+                &ctx.device,
+                &self.surface,
+                &ctx.surface_loader,
+                &self.window,
+            )?;
+
+            let swapchain_images = ctx.swapchain_loader.get_swapchain_images(swapchain)?;
+
+            let (image_views, framebuffers) = Self::create_framebuffers(
+                &ctx.device,
+                &swapchain_images,
+                self.render_pass,
+                extent,
+                surface_format.format,
+            )?;
+
+            let self_mut = self as *const Self as *mut Self;
+            (*self_mut).swapchain = swapchain;
+            (*self_mut).swapchain_extent = extent;
+            (*self_mut).swapchain_format = surface_format.format;
+            (*self_mut).swapchain_framebuffers = framebuffers;
+            (*self_mut).swapchain_image_views = image_views;
+            (*self_mut).swapchain_images = swapchain_images;
+
+            tracing::debug!("Main window swapchain recreated with extent {:?}", extent);
+        }
+
+        Ok(())
     }
 
     pub unsafe fn cleanup(&self) {

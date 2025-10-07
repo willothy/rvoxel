@@ -233,6 +233,19 @@ impl ApplicationHandler for App {
             }
         }
 
+        if let winit::event::WindowEvent::Resized(new_size) = event {
+            if window_id == self.renderer().window().id() {
+                if new_size.width > 0 && new_size.height > 0 {
+                    tracing::debug!("Main window resized to {:?}", new_size);
+                    unsafe {
+                        if let Err(e) = self.renderer().recreate_swapchain() {
+                            tracing::error!("Failed to recreate main window swapchain: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+
         match event {
             winit::event::WindowEvent::CloseRequested => {
                 event_loop.exit();

@@ -520,8 +520,6 @@ impl DebugWindow {
             let window = Arc::clone(&inner.window);
             let render_pass = inner.render_pass;
 
-            drop(inner);
-
             let (swapchain, surface_format, extent) = self.create_swapchain(&surface, &window)?;
 
             let swapchain_images = self.vk_ctx.swapchain_loader.get_swapchain_images(swapchain)?;
