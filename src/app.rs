@@ -1,8 +1,6 @@
-use std::cell::OnceCell;
 use std::sync::Arc;
 
 use bevy_ecs::{intern::Interned, prelude::*, query::QuerySingleError, schedule::ScheduleLabel};
-use egui::ViewportId;
 use glam::Vec3;
 use winit::{
     application::ApplicationHandler,
@@ -16,6 +14,7 @@ use crate::{
         mesh::Mesh,
         transform::Transform,
     },
+    debug::DebugWindow,
     renderer::vulkan::{context::VkContext, VulkanRenderer},
     resources::{input::InputState, time::Time, window_handle::WindowHandle},
 };
@@ -24,9 +23,7 @@ pub struct App {
     world: World,
     schedule: Interned<dyn ScheduleLabel>,
 
-    egui_ctx: egui::Context,
-    egui_state: OnceCell<egui_winit::State>,
-    egui_window: OnceCell<winit::window::Window>,
+    debug_window: DebugWindow,
 }
 
 impl App {
@@ -62,15 +59,10 @@ impl App {
         let label = schedule.label();
         world.add_schedule(schedule);
 
-        let egui_ctx = egui::Context::default();
-
         Ok(Self {
             world,
             schedule: label,
-
-            egui_ctx,
-            egui_state: OnceCell::new(),
-            egui_window: OnceCell::new(),
+            debug_window: DebugWindow::new(),
         })
     }
 
@@ -95,43 +87,7 @@ impl App {
                 window: self.renderer().window(),
             });
 
-        let egui_viewport = egui::ViewportBuilder::default()
-            .with_visible(true)
-            // .with_title("RVoxel Debug")
-            // .with_resizable(true)
-            // .with_inner_size(egui::Vec2::new(800., 600.))
-            // .with_titlebar_buttons_shown(true)
-            // .with_taskbar(true)
-        ;
-
-        let egui_window = egui_winit::create_window(&self.egui_ctx, event_loop, &egui_viewport)?;
-
-        // let attrs = winit::window::Window::default_attributes()
-        //     .with_content_protected(false)
-        //     .with_title("rvoxel debug")
-        //     .with_visible(true);
-        //
-        // let egui_window = event_loop.create_window(attrs)?;
-        //
-        // egui_window.set_visible(true);
-
-        let egui_state = egui_winit::State::new(
-            self.egui_ctx.clone(),
-            self.egui_ctx.viewport_id(),
-            &egui_window,
-            None,
-            None,
-            None,
-        );
-
-        self.egui_state
-            .set(egui_state)
-            .map_err(|_| ())
-            .expect("should only be initialized once");
-        self.egui_window
-            .set(egui_window)
-            .map_err(|_| ())
-            .expect("should only be initialized once");
+        self.debug_window.initialize(event_loop)?;
 
         Ok(())
     }
@@ -147,19 +103,12 @@ impl App {
     }
 
     fn draw_ui(&mut self) {
-        let input = self
-            .egui_state
-            .get_mut()
-            .unwrap()
-            .take_egui_input(&self.egui_window.get().unwrap());
-
         let camera_transform = self.camera_and_transform().unwrap().1.clone();
+        let renderer = self.renderer();
 
-        let ui = self.egui_ctx.run(input, |ctx| {
+        self.debug_window.draw(|ctx| {
             egui::SidePanel::new(egui::panel::Side::Left, egui::Id::new("debug_ui_sidepanel"))
                 .show(ctx, |ui| {
-                    let renderer = self.renderer();
-
                     ui.heading("Performance");
                     ui.label(format!("FPS: {:.1}", *renderer.debug().fps.read()));
                     ui.label(format!(
@@ -206,11 +155,6 @@ impl App {
                     ));
                 });
         });
-
-        self.egui_state
-            .get_mut()
-            .unwrap()
-            .handle_platform_output(&self.egui_window.get().unwrap(), ui.platform_output);
     }
 }
 
@@ -272,14 +216,10 @@ impl ApplicationHandler for App {
         window_id: winit::window::WindowId,
         event: winit::event::WindowEvent,
     ) {
-        if window_id == self.egui_window.get().unwrap().id() {
-            let res = self
-                .egui_state
-                .get_mut()
-                .unwrap()
-                .on_window_event(self.egui_window.get().as_ref().unwrap(), &event);
+        if window_id == self.debug_window.window().id() {
+            let res = self.debug_window.handle_event(&event);
             if res.repaint {
-                self.egui_window.get().unwrap().request_redraw();
+                self.debug_window.window().request_redraw();
             }
             if res.consumed {
                 return;
@@ -309,7 +249,7 @@ impl ApplicationHandler for App {
                     ) {
                         tracing::error!("Error: {e}")
                     }
-                } else if window_id == self.egui_window.get().unwrap().id() {
+                } else if window_id == self.debug_window.window().id() {
                     self.draw_ui();
                 }
             }
