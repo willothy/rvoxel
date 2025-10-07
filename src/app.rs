@@ -33,7 +33,8 @@ impl App {
         world.insert_resource(crate::resources::time::Time::default());
         world.insert_resource(crate::resources::input::InputState::default());
 
-        let vk = VulkanRenderer::new(Arc::new(VkContext::new()?));
+        let vk_ctx = Arc::new(VkContext::new()?);
+        let vk = VulkanRenderer::new(vk_ctx.clone());
         world.insert_resource(vk);
 
         let mut schedule = Schedule::default();
@@ -62,7 +63,7 @@ impl App {
         Ok(Self {
             world,
             schedule: label,
-            debug_window: DebugWindow::new(),
+            debug_window: DebugWindow::new(vk_ctx),
         })
     }
 
@@ -80,14 +81,13 @@ impl App {
         let renderer = self.renderer();
         unsafe {
             renderer.initialize(event_loop)?;
+            self.debug_window.initialize(event_loop)?;
         }
 
         self.world
             .insert_resource(crate::resources::window_handle::WindowHandle {
                 window: self.renderer().window(),
             });
-
-        self.debug_window.initialize(event_loop)?;
 
         Ok(())
     }
@@ -102,59 +102,63 @@ impl App {
         query.iter(&self.world).collect::<Vec<_>>()
     }
 
-    fn draw_ui(&mut self) {
+    fn render_debug_ui(&mut self) -> anyhow::Result<()> {
         let camera_transform = self.camera_and_transform().unwrap().1.clone();
         let renderer = self.renderer();
 
-        self.debug_window.draw(|ctx| {
-            egui::SidePanel::new(egui::panel::Side::Left, egui::Id::new("debug_ui_sidepanel"))
-                .show(ctx, |ui| {
-                    ui.heading("Performance");
-                    ui.label(format!("FPS: {:.1}", *renderer.debug().fps.read()));
-                    ui.label(format!(
-                        "Frame time: {:.3}ms",
-                        *renderer.debug().frame_time.read() * 1000.0
-                    ));
+        unsafe {
+            self.debug_window.render(|ctx| {
+                egui::SidePanel::new(egui::panel::Side::Left, egui::Id::new("debug_ui_sidepanel"))
+                    .show(ctx, |ui| {
+                        ui.heading("Performance");
+                        ui.label(format!("FPS: {:.1}", *renderer.debug().fps.read()));
+                        ui.label(format!(
+                            "Frame time: {:.3}ms",
+                            *renderer.debug().frame_time.read() * 1000.0
+                        ));
 
-                    ui.separator();
+                        ui.separator();
 
-                    ui.heading("Rendering");
+                        ui.heading("Rendering");
 
-                    if ui
-                        .checkbox(&mut *renderer.debug().wireframe.write(), "Wireframe")
-                        .changed()
-                    {
-                        tracing::info!(
-                            "Wireframe mode set to {}",
-                            *renderer.debug().wireframe.read()
-                        );
-                    }
+                        if ui
+                            .checkbox(&mut *renderer.debug().wireframe.write(), "Wireframe")
+                            .changed()
+                        {
+                            tracing::info!(
+                                "Wireframe mode set to {}",
+                                *renderer.debug().wireframe.read()
+                            );
+                        }
 
-                    ui.separator();
+                        ui.separator();
 
-                    ui.heading("Camera");
+                        ui.heading("Camera");
 
-                    if ui.button("Reset Camera").clicked() {
-                        tracing::info!("Camera reset!");
-                    }
+                        if ui.button("Reset Camera").clicked() {
+                            tracing::info!("Camera reset!");
+                        }
 
-                    // Calculate forward from the actual rotation quaternion
-                    let forward = camera_transform.rotation * Vec3::NEG_Z; // Rotate local -Z by camera rotation
+                        // Calculate forward from the actual rotation quaternion
+                        let forward = camera_transform.rotation * Vec3::NEG_Z; // Rotate local -Z by camera rotation
 
-                    ui.small("Transform");
+                        ui.small("Transform");
 
-                    ui.label(format!(
-                        "Position: ({:.2}, {:.2}, {:.2})",
-                        camera_transform.position.x,
-                        camera_transform.position.y,
-                        camera_transform.position.z
-                    ));
-                    ui.label(format!(
-                        "Rotation: ({:.2}, {:.2}, {:.2})",
-                        forward.x, forward.y, forward.z
-                    ));
-                });
-        });
+                        ui.label(format!(
+                            "Position: ({:.2}, {:.2}, {:.2})",
+                            camera_transform.position.x,
+                            camera_transform.position.y,
+                            camera_transform.position.z
+                        ));
+                        ui.label(format!(
+                            "Rotation: ({:.2}, {:.2}, {:.2})",
+                            forward.x, forward.y, forward.z
+                        ));
+                    });
+            })?;
+        }
+
+        Ok(())
     }
 }
 
@@ -186,7 +190,10 @@ impl ApplicationHandler for App {
     fn exiting(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
         // We need to clean up the Vulkan resources before the winit window is destroyed,
         // because the Vulkan resources need the window handle.
-        unsafe { self.renderer().cleanup_vulkan() };
+        unsafe {
+            self.debug_window.cleanup();
+            self.renderer().cleanup_vulkan();
+        }
     }
 
     fn about_to_wait(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
@@ -250,7 +257,9 @@ impl ApplicationHandler for App {
                         tracing::error!("Error: {e}")
                     }
                 } else if window_id == self.debug_window.window().id() {
-                    self.draw_ui();
+                    if let Err(e) = self.render_debug_ui() {
+                        tracing::error!("Debug UI render error: {e}");
+                    }
                 }
             }
             WindowEvent::KeyboardInput {
