@@ -45,9 +45,8 @@ impl Drop for VkContext {
             self.device.destroy_device(None);
 
             #[cfg(all(debug_assertions, feature = "debug"))]
-            self.ctx
-                .debug_utils_loader
-                .destroy_debug_utils_messenger(self.ctx.debug_messenger, None);
+            self.debug_utils_loader
+                .destroy_debug_utils_messenger(self.debug_messenger, None);
 
             self.instance.destroy_instance(None);
         }
