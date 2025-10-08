@@ -13,15 +13,15 @@
         libPath = with pkgs; lib.makeLibraryPath [
           libGL
           libxkbcommon
-          wayland
+          # wayland
           vulkan-tools
           vulkan-loader
           # vulkan-caps-viewer
           vulkan-headers
-          vulkan-extension-layer
+          # vulkan-extension-layer
           vulkan-validation-layers
           vulkan-utility-libraries
-          vulkan-tools-lunarg
+          # vulkan-tools-lunarg
         ];
       in
       {
@@ -41,6 +41,7 @@
           RUST_SRC_PATH = "${pkgs.rust.packages.stable.rustPlatform.rustLibSrc}";
           LD_LIBRARY_PATH = libPath;
           VULKAN_SDK = "${pkgs.vulkan-headers}";
+          DYLD_LIBRARY_PATH = "/opt/homebrew/lib:${libPath}";
           VK_LAYER_PATH = "${pkgs.vulkan-validation-layers}/share/vulkan/explicit_layer.d";
         };
       }
