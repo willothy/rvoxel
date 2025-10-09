@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use bevy_ecs::{intern::Interned, prelude::*, query::QuerySingleError, schedule::ScheduleLabel};
+use glam::Vec3;
 use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
@@ -13,6 +14,7 @@ use crate::{
         mesh::Mesh,
         transform::Transform,
     },
+    debug::DebugWindow,
     renderer::vulkan::{context::VkContext, VulkanRenderer},
     resources::{input::InputState, time::Time, window_handle::WindowHandle},
 };
@@ -20,6 +22,8 @@ use crate::{
 pub struct App {
     world: World,
     schedule: Interned<dyn ScheduleLabel>,
+
+    debug_window: DebugWindow,
 }
 
 impl App {
@@ -29,7 +33,8 @@ impl App {
         world.insert_resource(crate::resources::time::Time::default());
         world.insert_resource(crate::resources::input::InputState::default());
 
-        let vk = VulkanRenderer::new(Arc::new(VkContext::new()?));
+        let vk_ctx = Arc::new(VkContext::new()?);
+        let vk = VulkanRenderer::new(vk_ctx.clone());
         world.insert_resource(vk);
 
         let mut schedule = Schedule::default();
@@ -58,6 +63,7 @@ impl App {
         Ok(Self {
             world,
             schedule: label,
+            debug_window: DebugWindow::new(vk_ctx),
         })
     }
 
@@ -75,6 +81,7 @@ impl App {
         let renderer = self.renderer();
         unsafe {
             renderer.initialize(event_loop)?;
+            self.debug_window.initialize(event_loop)?;
         }
 
         self.world
@@ -93,6 +100,65 @@ impl App {
     pub fn meshes_with_transforms(&'_ mut self) -> Vec<(&Mesh, &Transform)> {
         let mut query = self.world.query::<(&Mesh, &Transform)>();
         query.iter(&self.world).collect::<Vec<_>>()
+    }
+
+    fn render_debug_ui(&mut self) -> anyhow::Result<()> {
+        let camera_transform = self.camera_and_transform().unwrap().1.clone();
+        let renderer = self.renderer();
+
+        unsafe {
+            self.debug_window.render(|ctx| {
+                egui::SidePanel::new(egui::panel::Side::Left, egui::Id::new("debug_ui_sidepanel"))
+                    .show(ctx, |ui| {
+                        ui.heading("Performance");
+                        ui.label(format!("FPS: {:.1}", *renderer.debug().fps.read()));
+                        ui.label(format!(
+                            "Frame time: {:.3}ms",
+                            *renderer.debug().frame_time.read() * 1000.0
+                        ));
+
+                        ui.separator();
+
+                        ui.heading("Rendering");
+
+                        if ui
+                            .checkbox(&mut *renderer.debug().wireframe.write(), "Wireframe")
+                            .changed()
+                        {
+                            tracing::info!(
+                                "Wireframe mode set to {}",
+                                *renderer.debug().wireframe.read()
+                            );
+                        }
+
+                        ui.separator();
+
+                        ui.heading("Camera");
+
+                        if ui.button("Reset Camera").clicked() {
+                            tracing::info!("Camera reset!");
+                        }
+
+                        // Calculate forward from the actual rotation quaternion
+                        let forward = camera_transform.rotation * Vec3::NEG_Z; // Rotate local -Z by camera rotation
+
+                        ui.small("Transform");
+
+                        ui.label(format!(
+                            "Position: ({:.2}, {:.2}, {:.2})",
+                            camera_transform.position.x,
+                            camera_transform.position.y,
+                            camera_transform.position.z
+                        ));
+                        ui.label(format!(
+                            "Rotation: ({:.2}, {:.2}, {:.2})",
+                            forward.x, forward.y, forward.z
+                        ));
+                    });
+            })?;
+        }
+
+        Ok(())
     }
 }
 
@@ -124,7 +190,10 @@ impl ApplicationHandler for App {
     fn exiting(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
         // We need to clean up the Vulkan resources before the winit window is destroyed,
         // because the Vulkan resources need the window handle.
-        unsafe { self.renderer().cleanup_vulkan() };
+        unsafe {
+            self.debug_window.cleanup();
+            self.renderer().cleanup_vulkan();
+        }
     }
 
     fn about_to_wait(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
@@ -132,6 +201,9 @@ impl ApplicationHandler for App {
 
         // self.world.run_schedule(self.schedule);
         self.world.resource_mut::<InputState>().reset_frame();
+
+        self.renderer().window().request_redraw();
+        self.debug_window.window().request_redraw();
     }
 
     fn device_event(
@@ -141,7 +213,6 @@ impl ApplicationHandler for App {
         event: winit::event::DeviceEvent,
     ) {
         if let winit::event::DeviceEvent::MouseMotion { delta } = event {
-            self.renderer().handle_egui_mouse_motion(delta);
             let mut input = self.world.resource_mut::<InputState>();
             if input.cursor_locked {
                 input.mouse_delta = (delta.0 as f32, delta.1 as f32);
@@ -152,35 +223,59 @@ impl ApplicationHandler for App {
     fn window_event(
         &mut self,
         event_loop: &winit::event_loop::ActiveEventLoop,
-        _window_id: winit::window::WindowId,
+        window_id: winit::window::WindowId,
         event: winit::event::WindowEvent,
     ) {
-        let Some(event) = self.renderer().handle_egui_event(event) else {
-            // egui handled the event
-            return;
-        };
+        if window_id == self.debug_window.window().id() {
+            let res = self.debug_window.handle_event(&event);
+            if res.repaint {
+                self.debug_window.window().request_redraw();
+            }
+            if res.consumed {
+                return;
+            }
+        }
+
+        if let winit::event::WindowEvent::Resized(new_size) = event {
+            if window_id == self.renderer().window().id() {
+                if new_size.width > 0 && new_size.height > 0 {
+                    tracing::debug!("Main window resized to {:?}", new_size);
+                    unsafe {
+                        if let Err(e) = self.renderer().recreate_swapchain() {
+                            tracing::error!("Failed to recreate main window swapchain: {}", e);
+                        }
+                    }
+                }
+            }
+        }
 
         match event {
             winit::event::WindowEvent::CloseRequested => {
                 event_loop.exit();
             }
             winit::event::WindowEvent::RedrawRequested => {
-                let (camera, cam_transform) = match self.camera_and_transform() {
-                    Ok((camera, transform)) => (camera.clone(), transform.clone()),
-                    Err(e) => {
-                        tracing::error!("Failed to get camera and transform: {}", e);
-                        return;
+                if window_id == self.renderer().window().id() {
+                    let (camera, cam_transform) = match self.camera_and_transform() {
+                        Ok((camera, transform)) => (camera.clone(), transform.clone()),
+                        Err(e) => {
+                            tracing::error!("Failed to get camera and transform: {}", e);
+                            return;
+                        }
+                    };
+
+                    self.world.resource_mut::<Time>().update();
+
+                    if let Err(e) = self.renderer().draw_frame(
+                        &cam_transform,
+                        &camera,
+                        &self.meshes_with_transforms(),
+                    ) {
+                        tracing::error!("Error: {e}")
                     }
-                };
-
-                self.world.resource_mut::<Time>().update();
-
-                if let Err(e) = self.renderer().draw_frame(
-                    &cam_transform,
-                    &camera,
-                    &self.meshes_with_transforms(),
-                ) {
-                    tracing::error!("Error: {e}")
+                } else if window_id == self.debug_window.window().id() {
+                    if let Err(e) = self.render_debug_ui() {
+                        tracing::error!("Debug UI render error: {e}");
+                    }
                 }
             }
             WindowEvent::KeyboardInput {
@@ -210,13 +305,6 @@ impl ApplicationHandler for App {
                         lock_cursor(&mut self.world);
                     }
                 }
-            }
-            WindowEvent::CursorMoved {
-                device_id,
-                position,
-            } => {
-                self.renderer()
-                    .handle_mouse_motion_diff((position.x, position.y));
             }
             _ => {}
         }

@@ -107,6 +107,8 @@ impl VkContext {
             // OS support
             #[cfg(target_os = "macos")]
             vk::KHR_PORTABILITY_ENUMERATION_NAME.as_ptr(),
+            #[cfg(target_os = "macos")]
+            vk::KHR_METAL_SURFACE_NAME.as_ptr(),
             #[cfg(target_os = "linux")]
             vk::KHR_WAYLAND_SURFACE_NAME.as_ptr(),
             #[cfg(target_os = "linux")]

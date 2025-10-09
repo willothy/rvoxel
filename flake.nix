@@ -41,6 +41,7 @@
           RUST_SRC_PATH = "${pkgs.rust.packages.stable.rustPlatform.rustLibSrc}";
           LD_LIBRARY_PATH = libPath;
           VULKAN_SDK = "${pkgs.vulkan-headers}";
+          DYLD_LIBRARY_PATH = "/opt/homebrew/lib:${libPath}";
           VK_LAYER_PATH = "${pkgs.vulkan-validation-layers}/share/vulkan/explicit_layer.d";
         };
       }

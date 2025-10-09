@@ -83,10 +83,6 @@ struct RendererInner {
     graphics_pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
 
-    egui_ctx: egui::Context,
-    egui_winit: Mutex<egui_winit::State>,
-    egui_renderer: Mutex<Option<egui_ash_renderer::Renderer>>,
-
     // Shared mesh data
     cube_vertex_buffer: vk::Buffer,
     cube_vertex_buffer_memory: vk::DeviceMemory,
@@ -95,9 +91,9 @@ struct RendererInner {
 }
 
 pub struct DebugState {
-    fps: RwLock<f32>,
-    frame_time: RwLock<f32>,
-    wireframe: RwLock<bool>,
+    pub fps: RwLock<f32>,
+    pub frame_time: RwLock<f32>,
+    pub wireframe: RwLock<bool>,
 }
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
@@ -124,6 +120,10 @@ impl VulkanRenderer {
         }
     }
 
+    pub fn debug(&self) -> &Arc<DebugState> {
+        &self.debug
+    }
+
     pub unsafe fn cleanup_vulkan(&self) {
         unsafe { self.inner.get().unwrap().cleanup() };
     }
@@ -132,27 +132,27 @@ impl VulkanRenderer {
         Arc::clone(&self.inner.get().unwrap().window)
     }
 
-    pub fn handle_egui_event(
-        &self,
-        event: winit::event::WindowEvent,
-    ) -> Option<winit::event::WindowEvent> {
-        self.vk().egui_handle_event(event)
-    }
+    // pub fn handle_egui_event(
+    //     &self,
+    //     event: winit::event::WindowEvent,
+    // ) -> Option<winit::event::WindowEvent> {
+    //     self.vk().egui_handle_event(event)
+    // }
+    //
+    // pub fn handle_mouse_motion_diff(&self, pos: (f64, f64)) {
+    //     let Some(cur) = self.vk().egui_ctx.pointer_interact_pos() else {
+    //         return;
+    //     };
+    //
+    //     let dx = cur.x as f64 - pos.0;
+    //     let dy = cur.y as f64 - pos.1;
+    //
+    //     self.handle_egui_mouse_motion((dx, dy));
+    // }
 
-    pub fn handle_mouse_motion_diff(&self, pos: (f64, f64)) {
-        let Some(cur) = self.vk().egui_ctx.pointer_interact_pos() else {
-            return;
-        };
-
-        let dx = cur.x as f64 - pos.0;
-        let dy = cur.y as f64 - pos.1;
-
-        self.handle_egui_mouse_motion((dx, dy));
-    }
-
-    pub fn handle_egui_mouse_motion(&self, delta: (f64, f64)) {
-        self.vk().egui_handle_mouse_motion(delta);
-    }
+    // pub fn handle_egui_mouse_motion(&self, delta: (f64, f64)) {
+    //     self.vk().egui_handle_mouse_motion(delta);
+    // }
 
     pub fn draw_frame(
         &self,
@@ -162,54 +162,7 @@ impl VulkanRenderer {
     ) -> anyhow::Result<()> {
         let vk = self.inner.get().unwrap();
 
-        let ui = vk.draw_ui(|ctx| {
-            egui::SidePanel::new(egui::panel::Side::Left, egui::Id::new("debug_ui_sidepanel"))
-                .show(ctx, |ui| {
-                    ui.heading("Performance");
-                    ui.label(format!("FPS: {:.1}", *self.debug.fps.read()));
-                    ui.label(format!(
-                        "Frame time: {:.3}ms",
-                        *self.debug.frame_time.read() * 1000.0
-                    ));
-
-                    ui.separator();
-
-                    ui.heading("Rendering");
-
-                    if ui
-                        .checkbox(&mut *self.debug.wireframe.write(), "Wireframe")
-                        .changed()
-                    {
-                        tracing::info!("Wireframe mode set to {}", *self.debug.wireframe.read());
-                    }
-
-                    ui.separator();
-
-                    ui.heading("Camera");
-
-                    if ui.button("Reset Camera").clicked() {
-                        tracing::info!("Camera reset!");
-                    }
-
-                    // Calculate forward from the actual rotation quaternion
-                    let forward = camera_transform.rotation * Vec3::NEG_Z; // Rotate local -Z by camera rotation
-
-                    ui.small("Transform");
-
-                    ui.label(format!(
-                        "Position: ({:.2}, {:.2}, {:.2})",
-                        camera_transform.position.x,
-                        camera_transform.position.y,
-                        camera_transform.position.z
-                    ));
-                    ui.label(format!(
-                        "Rotation: ({:.2}, {:.2}, {:.2})",
-                        forward.x, forward.y, forward.z
-                    ));
-                });
-        });
-
-        unsafe { vk.draw_frame(ui, &self.debug, camera, camera_transform, meshes) }
+        unsafe { vk.draw_frame(&self.debug, camera, camera_transform, meshes) }
     }
 
     pub unsafe fn initialize(
@@ -226,42 +179,46 @@ impl VulkanRenderer {
         Ok(())
     }
 
+    pub unsafe fn recreate_swapchain(&self) -> anyhow::Result<()> {
+        let vk = self.vk();
+        unsafe { vk.recreate_swapchain(&self.vk) }
+    }
+
     fn vk(&self) -> &RendererInner {
         self.inner.get().expect("VulkanRenderer not initialized")
     }
 }
 
 impl RendererInner {
-    pub fn egui_handle_event(
-        &self,
-        event: winit::event::WindowEvent,
-    ) -> Option<winit::event::WindowEvent> {
-        let res = self.egui_winit.lock().on_window_event(&self.window, &event);
-
-        if res.repaint {
-            self.window.request_redraw();
-        }
-
-        res.consumed.not().then_some(event)
-    }
-
-    pub fn egui_handle_mouse_motion(&self, delta: (f64, f64)) {
-        self.egui_winit.lock().on_mouse_motion((delta.0, delta.1));
-    }
-
-    pub fn draw_ui(&self, draw: impl FnMut(&egui::Context)) -> egui::FullOutput {
-        let raw_input = {
-            let mut egui_winit = self.egui_winit.lock();
-
-            egui_winit.take_egui_input(&self.window)
-        };
-
-        self.egui_ctx.run(raw_input, draw)
-    }
+    // pub fn egui_handle_event(
+    //     &self,
+    //     event: winit::event::WindowEvent,
+    // ) -> Option<winit::event::WindowEvent> {
+    //     let res = self.egui_winit.lock().on_window_event(&self.window, &event);
+    //
+    //     if res.repaint {
+    //         self.window.request_redraw();
+    //     }
+    //
+    //     res.consumed.not().then_some(event)
+    // }
+    //
+    // pub fn egui_handle_mouse_motion(&self, delta: (f64, f64)) {
+    //     self.egui_winit.lock().on_mouse_motion((delta.0, delta.1));
+    // }
+    //
+    // pub fn draw_ui(&self, draw: impl FnMut(&egui::Context)) -> egui::FullOutput {
+    //     let raw_input = {
+    //         let mut egui_winit = self.egui_winit.lock();
+    //
+    //         egui_winit.take_egui_input(&self.window)
+    //     };
+    //
+    //     self.egui_ctx.run(raw_input, draw)
+    // }
 
     unsafe fn draw_frame(
         &self,
-        ui: egui::FullOutput,
         debug: &DebugState,
         camera: &Camera,
         camera_transform: &Transform,
@@ -333,12 +290,7 @@ impl RendererInner {
         };
 
         // Step 4: Record commands
-        self.record_command_buffer(
-            self.command_buffers[current_frame],
-            image_index,
-            ui.clone(),
-            meshes,
-        )?;
+        self.record_command_buffer(self.command_buffers[current_frame], image_index, meshes)?;
 
         // Step 5: Submit commands to GPU
         unsafe { self.submit_commands(image_index)? };
@@ -346,11 +298,11 @@ impl RendererInner {
         // Step 6: Present the result
         unsafe { self.present_image(image_index)? };
 
-        self.egui_renderer
-            .lock()
-            .as_mut()
-            .unwrap()
-            .free_textures(&ui.textures_delta.free)?;
+        // self.egui_renderer
+        //     .lock()
+        //     .as_mut()
+        //     .unwrap()
+        //     .free_textures(&ui.textures_delta.free)?;
 
         // Step 7: Move to next frame
         self.current_frame
@@ -404,6 +356,53 @@ impl RendererInner {
                 .device
                 .unmap_memory(self.uniform_buffers_memory[current_image]);
         }
+    }
+
+    unsafe fn recreate_swapchain(&self, ctx: &Arc<context::VkContext>) -> anyhow::Result<()> {
+        unsafe {
+            self.ctx.device.device_wait_idle()?;
+
+            for &fb in &self.swapchain_framebuffers {
+                self.ctx.device.destroy_framebuffer(fb, None);
+            }
+
+            for &view in &self.swapchain_image_views {
+                self.ctx.device.destroy_image_view(view, None);
+            }
+
+            ctx.swapchain_loader.destroy_swapchain(self.swapchain, None);
+
+            let (swapchain, _, surface_format, extent) = Self::create_swap_chain(
+                &ctx.instance,
+                &ctx.physical_device,
+                &ctx.device,
+                &self.surface,
+                &ctx.surface_loader,
+                &self.window,
+            )?;
+
+            let swapchain_images = ctx.swapchain_loader.get_swapchain_images(swapchain)?;
+
+            let (image_views, framebuffers) = Self::create_framebuffers(
+                &ctx.device,
+                &swapchain_images,
+                self.render_pass,
+                extent,
+                surface_format.format,
+            )?;
+
+            let self_mut = self as *const Self as *mut Self;
+            (*self_mut).swapchain = swapchain;
+            (*self_mut).swapchain_extent = extent;
+            (*self_mut).swapchain_format = surface_format.format;
+            (*self_mut).swapchain_framebuffers = framebuffers;
+            (*self_mut).swapchain_image_views = image_views;
+            (*self_mut).swapchain_images = swapchain_images;
+
+            tracing::debug!("Main window swapchain recreated with extent {:?}", extent);
+        }
+
+        Ok(())
     }
 
     pub unsafe fn cleanup(&self) {
@@ -500,8 +499,8 @@ impl RendererInner {
             // Destroy surface
             self.ctx.surface_loader.destroy_surface(self.surface, None);
 
-            // Destroy egui renderer and state
-            drop(self.egui_renderer.lock().take());
+            // // Destroy egui renderer and state
+            // drop(self.egui_renderer.lock().take());
         }
     }
 
@@ -516,17 +515,6 @@ impl RendererInner {
 
         let window = ev.create_window(attrs)?;
 
-        let egui_ctx = egui::Context::default();
-
-        let egui_winit = egui_winit::State::new(
-            egui_ctx.clone(),
-            egui::ViewportId::ROOT,
-            &window,
-            None,
-            None,
-            None,
-        );
-
         let surface = unsafe { Self::create_surface(&ctx.entry, &ctx.instance, &window)? };
 
         let (swapchain, swapchain_loader, surface_format, extent) = unsafe {
@@ -539,6 +527,10 @@ impl RendererInner {
                 &window,
             )?
         };
+
+        let actual_window_size = window.inner_size();
+        tracing::debug!("Main window: after swapchain creation - window inner_size={:?}, swapchain extent={:?}",
+            actual_window_size, extent);
         let swapchain_images = unsafe { swapchain_loader.get_swapchain_images(swapchain)? };
 
         let command_pool =
@@ -601,19 +593,6 @@ impl RendererInner {
             )?
         };
 
-        let egui_renderer = egui_ash_renderer::Renderer::with_default_allocator(
-            &ctx.instance,
-            ctx.physical_device.clone(),
-            ctx.device.clone(),
-            render_pass.clone(),
-            egui_ash_renderer::Options {
-                in_flight_frames: MAX_FRAMES_IN_FLIGHT,
-                enable_depth_test: false,
-                enable_depth_write: false,
-                srgb_framebuffer: true,
-            },
-        )?;
-
         Ok(Self {
             ctx: Arc::clone(ctx),
 
@@ -662,9 +641,6 @@ impl RendererInner {
             render_pass,
             graphics_pipeline,
             pipeline_layout,
-            egui_ctx,
-            egui_winit: Mutex::new(egui_winit),
-            egui_renderer: Mutex::new(Some(egui_renderer)),
         })
     }
 
@@ -715,7 +691,6 @@ impl RendererInner {
         &self,
         command_buffer: vk::CommandBuffer,
         image_idx: u32,
-        ui: egui::FullOutput,
         meshes: &[(&Mesh, &Transform)],
     ) -> anyhow::Result<()> {
         let current_frame = self.current_frame.load(std::sync::atomic::Ordering::SeqCst);
@@ -807,36 +782,6 @@ impl RendererInner {
             }
         }
 
-        // Get egui render data
-        let output = ui;
-        let clipped_primitives = self
-            .egui_ctx
-            .tessellate(output.shapes, output.pixels_per_point);
-
-        // Render egui
-        if !clipped_primitives.is_empty() {
-            let mut renderer_guard = self.egui_renderer.lock();
-            let renderer = renderer_guard.as_mut().unwrap();
-
-            renderer.set_textures(
-                self.ctx.graphics_queue,
-                self.command_pool,
-                &output.textures_delta.set,
-            )?;
-
-            if let Err(e) = renderer.cmd_draw(
-                command_buffer,
-                vk::Extent2D {
-                    width: self.swapchain_extent.width,
-                    height: self.swapchain_extent.height,
-                },
-                output.pixels_per_point,
-                &clipped_primitives,
-            ) {
-                tracing::error!("Failed to render egui: {}", e);
-            }
-        }
-
         // End render pass
         unsafe { self.ctx.device.cmd_end_render_pass(command_buffer) };
 
@@ -911,12 +856,15 @@ impl RendererInner {
 
         let swapchain_device = ash::khr::swapchain::Device::new(&instance, &device);
 
+        let window_size = window.inner_size();
+        tracing::debug!("Main window: inner_size={:?}, scale_factor={}", window_size, window.scale_factor());
+        tracing::debug!("Main window: capabilities.current_extent={:?}", capabilities.current_extent);
+
         let extent = if capabilities.current_extent.width != u32::MAX {
             // Surface tells us exactly what size to use
             capabilities.current_extent
         } else {
             // We need to figure out the size from the window
-            let window_size = window.inner_size();
 
             vk::Extent2D {
                 width: window_size.width.clamp(
@@ -929,6 +877,8 @@ impl RendererInner {
                 ),
             }
         };
+
+        tracing::debug!("Main window: final extent={:?}", extent);
 
         let info = vk::SwapchainCreateInfoKHR::default()
             .surface(surface.clone())
