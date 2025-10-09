@@ -13,7 +13,7 @@
         libPath = with pkgs; lib.makeLibraryPath [
           libGL
           libxkbcommon
-          # wayland
+          wayland
           vulkan-tools
           vulkan-loader
           # vulkan-caps-viewer

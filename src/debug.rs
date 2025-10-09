@@ -49,6 +49,8 @@ impl DebugWindow {
     pub unsafe fn initialize(&mut self, ev: &ActiveEventLoop) -> anyhow::Result<()> {
         let viewport = ViewportBuilder::default()
             .with_visible(true)
+            .with_resizable(false)
+            .with_inner_size(egui::Vec2::new(800., 600.))
             .with_title("RVoxel Debug");
 
         let window = Arc::new(egui_winit::create_window(&self.ctx, ev, &viewport)?);
@@ -65,9 +67,8 @@ impl DebugWindow {
         };
 
         // Create swapchain (reuse logic from main renderer)
-        let (swapchain, surface_format, extent) = unsafe {
-            self.create_swapchain(&surface, &window)?
-        };
+        let (swapchain, surface_format, extent) =
+            unsafe { self.create_swapchain(&surface, &window)? };
 
         let actual_window_size = window.inner_size();
         tracing::debug!("Debug window: after swapchain creation - window inner_size={:?}, swapchain extent={:?}",
@@ -98,9 +99,8 @@ impl DebugWindow {
         let command_buffers = unsafe { self.allocate_command_buffers(command_pool)? };
 
         // Create synchronization objects (one pair per swapchain image)
-        let (image_available_semaphores, render_finished_semaphores) = unsafe {
-            self.create_semaphores(swapchain_images.len())?
-        };
+        let (image_available_semaphores, render_finished_semaphores) =
+            unsafe { self.create_semaphores(swapchain_images.len())? };
 
         // Create egui renderer
         let renderer = egui_ash_renderer::Renderer::with_default_allocator(
@@ -324,27 +324,32 @@ impl DebugWindow {
         Ok(unsafe { self.vk_ctx.device.allocate_command_buffers(&alloc_info)? })
     }
 
-    unsafe fn create_semaphores(&self, count: usize) -> anyhow::Result<(Vec<vk::Semaphore>, Vec<vk::Semaphore>)> {
+    unsafe fn create_semaphores(
+        &self,
+        count: usize,
+    ) -> anyhow::Result<(Vec<vk::Semaphore>, Vec<vk::Semaphore>)> {
         let semaphore_info = vk::SemaphoreCreateInfo::default();
 
         let mut image_available = Vec::with_capacity(count);
         let mut render_finished = Vec::with_capacity(count);
 
         for _ in 0..count {
-            image_available.push(unsafe {
-                self.vk_ctx.device.create_semaphore(&semaphore_info, None)?
-            });
+            image_available
+                .push(unsafe { self.vk_ctx.device.create_semaphore(&semaphore_info, None)? });
 
-            render_finished.push(unsafe {
-                self.vk_ctx.device.create_semaphore(&semaphore_info, None)?
-            });
+            render_finished
+                .push(unsafe { self.vk_ctx.device.create_semaphore(&semaphore_info, None)? });
         }
 
         Ok((image_available, render_finished))
     }
 
     pub fn window(&self) -> &Arc<winit::window::Window> {
-        &self.inner.get().expect("DebugWindow not initialized").window
+        &self
+            .inner
+            .get()
+            .expect("DebugWindow not initialized")
+            .window
     }
 
     pub fn ctx(&self) -> &egui::Context {
@@ -357,12 +362,17 @@ impl DebugWindow {
 
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
-            tracing::debug!("Debug window egui: screen_rect={:?}, viewport={:?}",
-                input.screen_rect, input.viewports.get(&input.viewport_id));
+            tracing::debug!(
+                "Debug window egui: screen_rect={:?}, viewport={:?}",
+                input.screen_rect,
+                input.viewports.get(&input.viewport_id)
+            );
         });
 
         let output = self.ctx.run(input, draw_fn);
-        inner.state.handle_platform_output(inner.window.as_ref(), output.platform_output.clone());
+        inner
+            .state
+            .handle_platform_output(inner.window.as_ref(), output.platform_output.clone());
         output
     }
 
@@ -378,10 +388,16 @@ impl DebugWindow {
             .collect();
 
         if !textures_to_set.is_empty() {
-            inner.renderer.set_textures(self.vk_ctx.graphics_queue, inner.command_pool, &textures_to_set)?;
+            inner.renderer.set_textures(
+                self.vk_ctx.graphics_queue,
+                inner.command_pool,
+                &textures_to_set,
+            )?;
         }
 
-        let current_frame = inner.current_frame.load(std::sync::atomic::Ordering::SeqCst);
+        let current_frame = inner
+            .current_frame
+            .load(std::sync::atomic::Ordering::SeqCst);
 
         let (image_index, _) = unsafe {
             self.vk_ctx.swapchain_loader.acquire_next_image(
@@ -514,7 +530,9 @@ impl DebugWindow {
                 self.vk_ctx.device.destroy_image_view(view, None);
             }
 
-            self.vk_ctx.swapchain_loader.destroy_swapchain(inner.swapchain, None);
+            self.vk_ctx
+                .swapchain_loader
+                .destroy_swapchain(inner.swapchain, None);
 
             let surface = inner.surface;
             let window = Arc::clone(&inner.window);
@@ -522,7 +540,10 @@ impl DebugWindow {
 
             let (swapchain, surface_format, extent) = self.create_swapchain(&surface, &window)?;
 
-            let swapchain_images = self.vk_ctx.swapchain_loader.get_swapchain_images(swapchain)?;
+            let swapchain_images = self
+                .vk_ctx
+                .swapchain_loader
+                .get_swapchain_images(swapchain)?;
 
             let (image_views, framebuffers) = self.create_framebuffers(
                 &swapchain_images,
@@ -561,7 +582,9 @@ impl DebugWindow {
                     self.vk_ctx.device.destroy_semaphore(semaphore, None);
                 }
 
-                self.vk_ctx.device.destroy_command_pool(inner.command_pool, None);
+                self.vk_ctx
+                    .device
+                    .destroy_command_pool(inner.command_pool, None);
 
                 for &fb in &inner.framebuffers {
                     self.vk_ctx.device.destroy_framebuffer(fb, None);
@@ -571,13 +594,17 @@ impl DebugWindow {
                     self.vk_ctx.device.destroy_image_view(view, None);
                 }
 
-                self.vk_ctx.device.destroy_render_pass(inner.render_pass, None);
+                self.vk_ctx
+                    .device
+                    .destroy_render_pass(inner.render_pass, None);
 
                 self.vk_ctx
                     .swapchain_loader
                     .destroy_swapchain(inner.swapchain, None);
 
-                self.vk_ctx.surface_loader.destroy_surface(inner.surface, None);
+                self.vk_ctx
+                    .surface_loader
+                    .destroy_surface(inner.surface, None);
             }
         }
     }
