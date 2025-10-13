@@ -1,5 +1,5 @@
 {
-  description = "Rust development environment";
+  description = "Rust/Vulkan development environment";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -10,22 +10,35 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
-        libPath = with pkgs; lib.makeLibraryPath [
+        lib = pkgs.lib;
+
+        isLinux = pkgs.stdenv.isLinux;
+        isDarwin = pkgs.stdenv.isDarwin;
+
+        # Graphics/runtime libs: add Wayland only on Linux.
+        gfxLibs = with pkgs; [
           libGL
           libxkbcommon
-          # wayland
-          vulkan-tools
           vulkan-loader
-          # vulkan-caps-viewer
-          vulkan-headers
-          # vulkan-extension-layer
           vulkan-validation-layers
           vulkan-utility-libraries
-          # vulkan-tools-lunarg
+        ] ++ lib.optionals isLinux [
+          wayland
         ];
+
+        libPath = pkgs.lib.makeLibraryPath gfxLibs;
+
+        linuxEnv = lib.optionalAttrs isLinux {
+          LD_LIBRARY_PATH = libPath;
+        };
+
+        darwinEnv = lib.optionalAttrs isDarwin {
+          # Homebrew path is common on Apple Silicon; harmless if absent.
+          DYLD_LIBRARY_PATH = "/opt/homebrew/lib:${libPath}";
+        };
       in
       {
-        devShells.default = pkgs.mkShell {
+        devShells.default = pkgs.mkShell ({
           buildInputs = with pkgs; [
             cargo
             rustc
@@ -33,17 +46,15 @@
           ];
 
           packages = with pkgs; [
-            # valgrind
             gdb
           ];
 
+          # Common env
           RUST_LOG = "debug";
           RUST_SRC_PATH = "${pkgs.rust.packages.stable.rustPlatform.rustLibSrc}";
-          LD_LIBRARY_PATH = libPath;
           VULKAN_SDK = "${pkgs.vulkan-headers}";
-          DYLD_LIBRARY_PATH = "/opt/homebrew/lib:${libPath}";
           VK_LAYER_PATH = "${pkgs.vulkan-validation-layers}/share/vulkan/explicit_layer.d";
-        };
+        } // linuxEnv // darwinEnv);
       }
     );
 }
