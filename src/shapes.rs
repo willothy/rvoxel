@@ -160,3 +160,31 @@ pub const TRIANGLE_VERTICES: [Vertex; 3] = [
         normal: glam::Vec3::new(0.0, 0.0, 1.0),
     }, // Bottom left, blue
 ];
+
+pub const FULL_SCREEN_QUAD_VERTICES: [Vertex; 4] = [
+    Vertex {
+        pos: glam::Vec3::new(-1.0, -1.0, 0.0),
+        color: glam::Vec3::new(1.0, 0.0, 0.0),
+        normal: glam::Vec3::new(0.0, 0.0, 1.0),
+    }, // Bottom left, red
+    Vertex {
+        pos: glam::Vec3::new(1.0, -1.0, 0.0),
+        color: glam::Vec3::new(0.0, 1.0, 0.0),
+        normal: glam::Vec3::new(0.0, 0.0, 1.0),
+    }, // Bottom right, green
+    Vertex {
+        pos: glam::Vec3::new(1.0, 1.0, 0.0),
+        color: glam::Vec3::new(0.0, 0.0, 1.0),
+        normal: glam::Vec3::new(0.0, 0.0, 1.0),
+    }, // Top right, blue
+    Vertex {
+        pos: glam::Vec3::new(-1.0, 1.0, 0.0),
+        color: glam::Vec3::new(1.0, 1.0, 1.0),
+        normal: glam::Vec3::new(0.0, 0.0, 1.0),
+    }, // Top left, white
+];
+
+pub const FULL_SCREEN_QUAD_INDICES: [u16; 6] = [
+    0, 1, 2, // First triangle
+    2, 3, 0, // Second triangle
+];

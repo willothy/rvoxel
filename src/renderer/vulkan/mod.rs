@@ -1,6 +1,5 @@
 use std::{
     ffi::CStr,
-    ops::Not,
     sync::{atomic::AtomicUsize, Arc, OnceLock},
 };
 
@@ -11,7 +10,7 @@ use glam::{Mat4, Vec3};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::Window;
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 
 use crate::{
     components::{
@@ -154,15 +153,10 @@ impl VulkanRenderer {
     //     self.vk().egui_handle_mouse_motion(delta);
     // }
 
-    pub fn draw_frame(
-        &self,
-        camera_transform: &Transform,
-        camera: &Camera,
-        meshes: &[(&Mesh, &Transform)],
-    ) -> anyhow::Result<()> {
+    pub fn draw_frame(&self, camera_transform: &Transform, camera: &Camera) -> anyhow::Result<()> {
         let vk = self.inner.get().unwrap();
 
-        unsafe { vk.draw_frame(&self.debug, camera, camera_transform, meshes) }
+        unsafe { vk.draw_frame(&self.debug, camera, camera_transform) }
     }
 
     pub unsafe fn initialize(
@@ -222,7 +216,6 @@ impl RendererInner {
         debug: &DebugState,
         camera: &Camera,
         camera_transform: &Transform,
-        meshes: &[(&Mesh, &Transform)],
     ) -> anyhow::Result<()> {
         let start_time = std::time::Instant::now();
 
@@ -290,7 +283,7 @@ impl RendererInner {
         };
 
         // Step 4: Record commands
-        self.record_command_buffer(self.command_buffers[current_frame], image_index, meshes)?;
+        self.record_command_buffer(self.command_buffers[current_frame], image_index)?;
 
         // Step 5: Submit commands to GPU
         unsafe { self.submit_commands(image_index)? };
@@ -331,7 +324,17 @@ impl RendererInner {
         let view = camera_transform.matrix().inverse();
         let projection = Mat4::perspective_rh(camera.fov, aspect_ratio, camera.near, camera.far);
 
-        let ubo = UniformBufferObject { view, projection };
+        let ubo = UniformBufferObject {
+            view,
+            projection,
+            camera_position: camera_transform.position.extend(0.),
+            resolution: Vec3::new(
+                self.swapchain_extent.width as f32,
+                self.swapchain_extent.height as f32,
+                aspect_ratio,
+            )
+            .extend(0.),
+        };
 
         let current_image = self.current_frame.load(std::sync::atomic::Ordering::SeqCst);
 
@@ -529,8 +532,11 @@ impl RendererInner {
         };
 
         let actual_window_size = window.inner_size();
-        tracing::debug!("Main window: after swapchain creation - window inner_size={:?}, swapchain extent={:?}",
-            actual_window_size, extent);
+        tracing::debug!(
+            "Main window: after swapchain creation - window inner_size={:?}, swapchain extent={:?}",
+            actual_window_size,
+            extent
+        );
         let swapchain_images = unsafe { swapchain_loader.get_swapchain_images(swapchain)? };
 
         let command_pool =
@@ -691,7 +697,6 @@ impl RendererInner {
         &self,
         command_buffer: vk::CommandBuffer,
         image_idx: u32,
-        meshes: &[(&Mesh, &Transform)],
     ) -> anyhow::Result<()> {
         let current_frame = self.current_frame.load(std::sync::atomic::Ordering::SeqCst);
 
@@ -736,6 +741,32 @@ impl RendererInner {
             )
         };
 
+        let swapchain_extent = self.swapchain_extent;
+
+        // 4. Viewport and scissor - what part of screen to render to
+        let viewports = [vk::Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: swapchain_extent.width as f32,
+            height: swapchain_extent.height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        }];
+
+        let scissors = [vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: swapchain_extent,
+        }];
+
+        unsafe {
+            self.ctx
+                .device
+                .cmd_set_viewport(command_buffer, 0, &viewports);
+            self.ctx
+                .device
+                .cmd_set_scissor(command_buffer, 0, &scissors);
+        }
+
         // Bind vertex buffer
         let vertex_buffers = [self.cube_vertex_buffer];
         let offsets = [0];
@@ -760,26 +791,15 @@ impl RendererInner {
                 &[],
             );
 
-            for (_mesh, transform) in meshes {
-                let model = [transform.matrix()];
-
-                self.ctx.device.cmd_push_constants(
-                    command_buffer,
-                    self.pipeline_layout,
-                    vk::ShaderStageFlags::VERTEX,
-                    0,
-                    bytemuck::cast_slice(&model),
-                );
-
-                self.ctx.device.cmd_draw_indexed(
-                    command_buffer,
-                    crate::shapes::CUBE_INDICES.len() as u32,
-                    1,
-                    0,
-                    0,
-                    0,
-                );
-            }
+            // Draw fullscreen quad once - no transforms needed for raymarching!
+            self.ctx.device.cmd_draw_indexed(
+                command_buffer,
+                crate::shapes::FULL_SCREEN_QUAD_INDICES.len() as u32,
+                1, // instance count
+                0, // first index
+                0, // vertex offset
+                0, // first instance
+            );
         }
 
         // End render pass
@@ -857,8 +877,15 @@ impl RendererInner {
         let swapchain_device = ash::khr::swapchain::Device::new(&instance, &device);
 
         let window_size = window.inner_size();
-        tracing::debug!("Main window: inner_size={:?}, scale_factor={}", window_size, window.scale_factor());
-        tracing::debug!("Main window: capabilities.current_extent={:?}", capabilities.current_extent);
+        tracing::debug!(
+            "Main window: inner_size={:?}, scale_factor={}",
+            window_size,
+            window.scale_factor()
+        );
+        tracing::debug!(
+            "Main window: capabilities.current_extent={:?}",
+            capabilities.current_extent
+        );
 
         let extent = if capabilities.current_extent.width != u32::MAX {
             // Surface tells us exactly what size to use
@@ -969,7 +996,7 @@ impl RendererInner {
             .binding(0) // binding = 0 in shader
             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
             .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::VERTEX); // Used in vertex shader
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT);
 
         let bindings = [ubo_layout_binding];
         let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
@@ -1100,8 +1127,9 @@ impl RendererInner {
         instance: &ash::Instance,
         physical_device: vk::PhysicalDevice,
     ) -> anyhow::Result<(vk::Buffer, vk::DeviceMemory)> {
-        let buffer_size =
-            (std::mem::size_of::<u16>() * crate::shapes::CUBE_INDICES.len()) as vk::DeviceSize;
+        let buffer_size = (std::mem::size_of::<u16>()
+            * crate::shapes::FULL_SCREEN_QUAD_INDICES.len())
+            as vk::DeviceSize;
 
         // Create buffer
         let buffer_info = vk::BufferCreateInfo::default()
@@ -1151,9 +1179,9 @@ impl RendererInner {
 
         unsafe {
             std::ptr::copy_nonoverlapping(
-                crate::shapes::CUBE_INDICES.as_ptr(),
+                crate::shapes::FULL_SCREEN_QUAD_INDICES.as_ptr(),
                 data_ptr,
-                crate::shapes::CUBE_INDICES.len(),
+                crate::shapes::FULL_SCREEN_QUAD_INDICES.len(),
             )
         };
 
@@ -1161,7 +1189,7 @@ impl RendererInner {
 
         tracing::info!(
             "Index buffer created with {} indices",
-            crate::shapes::CUBE_INDICES.len()
+            crate::shapes::FULL_SCREEN_QUAD_INDICES.len()
         );
 
         Ok((buffer, buffer_memory))
@@ -1296,8 +1324,9 @@ impl RendererInner {
         instance: &ash::Instance,
         physical_device: vk::PhysicalDevice,
     ) -> anyhow::Result<(vk::Buffer, vk::DeviceMemory)> {
-        let buffer_size =
-            (std::mem::size_of::<Vertex>() * crate::shapes::CUBE_VERTICES.len()) as vk::DeviceSize;
+        let buffer_size = (std::mem::size_of::<Vertex>()
+            * crate::shapes::FULL_SCREEN_QUAD_VERTICES.len())
+            as vk::DeviceSize;
 
         // Create the buffer object
         let buffer_info = vk::BufferCreateInfo::default()
@@ -1352,9 +1381,9 @@ impl RendererInner {
 
             // Copy our vertex data
             std::ptr::copy_nonoverlapping(
-                crate::shapes::CUBE_VERTICES.as_ptr(),
+                crate::shapes::FULL_SCREEN_QUAD_VERTICES.as_ptr(),
                 data_ptr,
-                crate::shapes::CUBE_VERTICES.len(),
+                crate::shapes::FULL_SCREEN_QUAD_VERTICES.len(),
             );
 
             // Unmap when done
@@ -1499,8 +1528,12 @@ impl RendererInner {
                 .context("Failed to create pipeline layout")?
         };
 
+        let dynamic_state_info = vk::PipelineDynamicStateCreateInfo::default()
+            .dynamic_states(&[vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR]);
+
         // 9. Create the graphics pipeline
         let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+            .dynamic_state(&dynamic_state_info) // No dynamic state for
             .stages(&shader_stages)
             .vertex_input_state(&vertex_input_info)
             .input_assembly_state(&input_assembly)

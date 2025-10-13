@@ -3,6 +3,9 @@ pub struct UniformBufferObject {
     pub view: glam::Mat4,
     /// Perspective projection
     pub projection: glam::Mat4,
+
+    pub camera_position: glam::Vec4,
+    pub resolution: glam::Vec4,
 }
 
 pub struct PushConstants {

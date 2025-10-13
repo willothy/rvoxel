@@ -178,11 +178,10 @@ impl ApplicationHandler for App {
             }
         };
 
-        if let Err(e) = self.renderer().draw_frame(
-            &cam_transform.clone(),
-            &camera.clone(),
-            &self.meshes_with_transforms(),
-        ) {
+        if let Err(e) = self
+            .renderer()
+            .draw_frame(&cam_transform.clone(), &camera.clone())
+        {
             tracing::error!("Error: {e}")
         }
     }
@@ -265,11 +264,7 @@ impl ApplicationHandler for App {
 
                     self.world.resource_mut::<Time>().update();
 
-                    if let Err(e) = self.renderer().draw_frame(
-                        &cam_transform,
-                        &camera,
-                        &self.meshes_with_transforms(),
-                    ) {
+                    if let Err(e) = self.renderer().draw_frame(&cam_transform, &camera) {
                         tracing::error!("Error: {e}")
                     }
                 } else if window_id == self.debug_window.window().id() {
