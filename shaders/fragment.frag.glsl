@@ -49,6 +49,15 @@ float rayMarch(vec3 origin, vec3 direction) {
     return -1.0; // Miss
 }
 
+vec3 calculateNormal(vec3 p) {
+    float h = EPSILON ;
+    return normalize(vec3(
+        sceneSDF(p + vec3(h, 0.0, 0.0)) - sceneSDF(p - vec3(h, 0.0, 0.0)),
+        sceneSDF(p + vec3(0.0, h, 0.0)) - sceneSDF(p - vec3(0.0, h, 0.0)),
+        sceneSDF(p + vec3(0.0, 0.0, h)) - sceneSDF(p - vec3(0.0, 0.0, h))
+    ));
+}
+
 void main() {
     float aspect_ratio = ubo.resolution.z;
     vec2 screen_size = ubo.resolution.xy;
@@ -66,10 +75,25 @@ void main() {
 
     float t = rayMarch(ray_origin, ray_dir_world);
 
-    if (t > 0.0) {
-        outColor = vec4(1.0, 0.0, 0.0, 1.0);  // Hit: red color
+    if (t >= 0.0) {
+        vec3 light_dir = normalize(vec3(1.0, 1.0, -1.0));
+
+        vec3 normal = calculateNormal(ray_origin + ray_dir_world * t);
+
+
+        float ambient = 0.1;
+        float diffuse = max(0.0, dot(normal, light_dir));
+        float brightness = ambient + (1.0 - ambient) * diffuse;
+
+        // Hit: red color
+        outColor = vec4(
+            clamp(0.5 * brightness, 0.0, 1.0),
+            clamp(0.0 * brightness, 0.0, 1.0),
+            clamp(0.0 * brightness, 0.0, 1.0),
+            1.0
+        );
     } else {
-        outColor = vec4(0.0, 0.0, 0.0, 1.0);  // Miss: black color
+        outColor = vec4(0.1, 0.1, 0.1, 1.0);  // Miss: black color
     }
 
 }
