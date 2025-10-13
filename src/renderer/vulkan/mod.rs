@@ -19,6 +19,10 @@ use crate::{
         transform::Transform,
     },
     renderer::uniforms::UniformBufferObject,
+    world::{
+        chunk::{Chunk, CHUNK_BYTES},
+        coords::{ChunkCoords, CHUNK_SIZE},
+    },
 };
 
 pub mod context;
@@ -81,6 +85,14 @@ struct RendererInner {
     render_pass: vk::RenderPass,
     graphics_pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
+
+    voxel_image: vk::Image,
+    voxel_image_memory: vk::DeviceMemory,
+    voxel_image_view: vk::ImageView,
+    voxel_sampler: vk::Sampler,
+
+    voxel_buffer: vk::Buffer,
+    voxel_buffer_memory: vk::DeviceMemory,
 
     // Shared mesh data
     cube_vertex_buffer: vk::Buffer,
@@ -184,32 +196,519 @@ impl VulkanRenderer {
 }
 
 impl RendererInner {
-    // pub fn egui_handle_event(
-    //     &self,
-    //     event: winit::event::WindowEvent,
-    // ) -> Option<winit::event::WindowEvent> {
-    //     let res = self.egui_winit.lock().on_window_event(&self.window, &event);
-    //
-    //     if res.repaint {
-    //         self.window.request_redraw();
-    //     }
-    //
-    //     res.consumed.not().then_some(event)
-    // }
-    //
-    // pub fn egui_handle_mouse_motion(&self, delta: (f64, f64)) {
-    //     self.egui_winit.lock().on_mouse_motion((delta.0, delta.1));
-    // }
-    //
-    // pub fn draw_ui(&self, draw: impl FnMut(&egui::Context)) -> egui::FullOutput {
-    //     let raw_input = {
-    //         let mut egui_winit = self.egui_winit.lock();
-    //
-    //         egui_winit.take_egui_input(&self.window)
-    //     };
-    //
-    //     self.egui_ctx.run(raw_input, draw)
-    // }
+    pub fn new(
+        ctx: &Arc<context::VkContext>,
+        ev: &winit::event_loop::ActiveEventLoop,
+    ) -> anyhow::Result<Self> {
+        let attrs = winit::window::Window::default_attributes()
+            .with_content_protected(false)
+            .with_title("rvoxel")
+            .with_visible(true);
+
+        let window = ev.create_window(attrs)?;
+
+        let surface = unsafe { Self::create_surface(&ctx.entry, &ctx.instance, &window)? };
+
+        let (swapchain, swapchain_loader, surface_format, extent) = unsafe {
+            Self::create_swap_chain(
+                &ctx.instance,
+                &ctx.physical_device,
+                &ctx.device,
+                &surface,
+                &ctx.surface_loader,
+                &window,
+            )?
+        };
+
+        let actual_window_size = window.inner_size();
+        tracing::debug!(
+            "Main window: after swapchain creation - window inner_size={:?}, swapchain extent={:?}",
+            actual_window_size,
+            extent
+        );
+        let swapchain_images = unsafe { swapchain_loader.get_swapchain_images(swapchain)? };
+
+        let command_pool =
+            unsafe { Self::create_command_pool(&ctx.device, ctx.graphics_queue_family_index)? };
+
+        let command_buffers = unsafe { Self::create_command_buffers(&ctx.device, &command_pool)? };
+
+        let (
+            image_available_semaphores,
+            render_finished_semaphores,
+            in_flight_fences,
+            images_in_flight,
+        ) = unsafe { Self::create_sync_objects(&ctx.device, swapchain_images.len())? };
+
+        let (cube_vertex_buffer, cube_vertex_buffer_memory) =
+            Self::create_vertex_buffer(&ctx.device, &ctx.instance, ctx.physical_device)?;
+
+        let (cube_index_buffer, cube_index_buffer_memory) =
+            unsafe { Self::create_index_buffer(&ctx.device, &ctx.instance, ctx.physical_device)? };
+
+        let (voxel_image, voxel_image_memory, voxel_image_view, voxel_sampler) = unsafe {
+            Self::create_voxel_texture(&ctx.device, &ctx.instance, &ctx.physical_device)?
+        };
+        let (voxel_buffer, voxel_buffer_memory) =
+            unsafe { Self::create_voxel_buffer(&ctx.device, &ctx.instance, &ctx.physical_device)? };
+
+        let descriptor_set_layout = unsafe { Self::create_descriptor_set_layout(&ctx.device) };
+        let descriptor_pool = unsafe { Self::create_descriptor_pool(&ctx.device) };
+        let (uniform_buffers, uniform_buffers_memory) = unsafe {
+            Self::create_uniform_buffers(&ctx.device, &ctx.instance, ctx.physical_device)?
+        };
+        let descriptor_sets = unsafe {
+            Self::create_descriptor_sets(
+                &ctx.device,
+                descriptor_pool,
+                descriptor_set_layout,
+                &uniform_buffers,
+                voxel_image_view.clone(),
+                voxel_sampler.clone(),
+            )?
+        };
+
+        let vert_shader_module = unsafe {
+            Self::create_shader_module(&ctx.device, &super::shaders::compile_vertex_shader()?)?
+        };
+        let frag_shader_module = unsafe {
+            Self::create_shader_module(&ctx.device, &super::shaders::compile_fragment_shader()?)?
+        };
+
+        let render_pass = unsafe { Self::create_render_pass(&ctx.device, surface_format.format)? };
+
+        let (graphics_pipeline, pipeline_layout) = Self::create_graphics_pipeline(
+            &ctx.device,
+            extent,
+            render_pass,
+            vert_shader_module,
+            frag_shader_module,
+            descriptor_set_layout,
+        )?;
+
+        let (swapchain_image_views, swapchain_framebuffers) = unsafe {
+            Self::create_framebuffers(
+                &ctx.device,
+                &swapchain_images,
+                render_pass,
+                extent,
+                surface_format.format,
+            )?
+        };
+
+        unsafe {
+            let alloc_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(command_pool.clone())
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+
+            let buffers = ctx.device.allocate_command_buffers(&alloc_info)?;
+
+            if buffers.len() != 1 {
+                return Err(anyhow::anyhow!(
+                    "Expected to allocate exactly 1 command buffer, got {}",
+                    buffers.len()
+                ));
+            }
+
+            let buffer = buffers[0];
+
+            let begin = vk::CommandBufferBeginInfo::default();
+
+            ctx.device.begin_command_buffer(buffer, &begin)?;
+
+            {
+                let image_barrier = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(voxel_image)
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .base_mip_level(0)
+                            .level_count(1)
+                            .base_array_layer(0)
+                            .layer_count(1),
+                    )
+                    .src_access_mask(vk::AccessFlags::NONE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+
+                ctx.device.cmd_pipeline_barrier(
+                    buffer,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[image_barrier],
+                );
+            }
+
+            let region = vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .buffer_row_length(0)
+                .buffer_image_height(0)
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .mip_level(0)
+                        .base_array_layer(0)
+                        .layer_count(1),
+                )
+                .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                .image_extent(vk::Extent3D {
+                    width: CHUNK_SIZE,
+                    height: CHUNK_SIZE,
+                    depth: CHUNK_SIZE,
+                });
+
+            ctx.device.cmd_copy_buffer_to_image(
+                buffer,
+                voxel_buffer,
+                voxel_image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[region],
+            );
+
+            {
+                let image_barrier = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(voxel_image)
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .base_mip_level(0)
+                            .level_count(1)
+                            .base_array_layer(0)
+                            .layer_count(1),
+                    )
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ);
+
+                ctx.device.cmd_pipeline_barrier(
+                    buffer,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[image_barrier],
+                );
+            }
+
+            ctx.device.end_command_buffer(buffer)?;
+
+            let submit_info =
+                vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&buffer));
+
+            ctx.device
+                .queue_submit(ctx.graphics_queue, &[submit_info], vk::Fence::null())?;
+
+            ctx.device.queue_wait_idle(ctx.graphics_queue)?;
+
+            ctx.device.free_command_buffers(command_pool, &[buffer]);
+        }
+
+        Ok(Self {
+            ctx: Arc::clone(ctx),
+
+            window: Arc::new(window),
+
+            surface,
+
+            swapchain,
+            swapchain_format: surface_format.format,
+            swapchain_extent: extent,
+            swapchain_images,
+            swapchain_framebuffers,
+            swapchain_image_views,
+
+            command_pool,
+            command_buffers,
+
+            image_available_semaphores,
+            render_finished_semaphores,
+            in_flight_fences,
+            images_in_flight,
+
+            current_frame: 0.into(),
+
+            // vertex_buffer,
+            // vertex_buffer_memory,
+            //
+            // index_buffer,
+            // index_buffer_memory,
+            cube_vertex_buffer,
+            cube_vertex_buffer_memory,
+
+            cube_index_buffer,
+            cube_index_buffer_memory,
+
+            uniform_buffers,
+            uniform_buffers_memory,
+
+            descriptor_set_layout,
+            descriptor_pool,
+            descriptor_sets,
+
+            vert_shader_module,
+            frag_shader_module,
+
+            voxel_image,
+            voxel_image_memory,
+            voxel_image_view,
+            voxel_sampler,
+
+            voxel_buffer,
+            voxel_buffer_memory,
+
+            render_pass,
+            graphics_pipeline,
+            pipeline_layout,
+        })
+    }
+
+    pub unsafe fn cleanup(&self) {
+        unsafe {
+            // Wait for all GPU work to finish before destroying anything
+            self.ctx.device.device_wait_idle().unwrap();
+
+            // Destroy synchronization objects (per-frame objects)
+            for i in 0..MAX_FRAMES_IN_FLIGHT {
+                self.ctx
+                    .device
+                    .destroy_semaphore(self.image_available_semaphores[i], None);
+                self.ctx
+                    .device
+                    .destroy_fence(self.in_flight_fences[i], None);
+            }
+
+            // Destroy per-swapchain-image semaphores
+            for i in 0..self.swapchain_images.len() {
+                self.ctx
+                    .device
+                    .destroy_semaphore(self.render_finished_semaphores[i], None);
+            }
+
+            // Destroy command pool (automatically frees command buffers)
+            self.ctx
+                .device
+                .destroy_command_pool(self.command_pool, None);
+
+            // Destroy cube shared buffers and memory
+            self.ctx
+                .device
+                .destroy_buffer(self.cube_vertex_buffer, None);
+            self.ctx
+                .device
+                .free_memory(self.cube_vertex_buffer_memory, None);
+
+            self.ctx.device.destroy_buffer(self.cube_index_buffer, None);
+            self.ctx
+                .device
+                .free_memory(self.cube_index_buffer_memory, None);
+
+            self.ctx.device.destroy_buffer(self.voxel_buffer, None);
+            self.ctx.device.free_memory(self.voxel_buffer_memory, None);
+            self.ctx.device.destroy_sampler(self.voxel_sampler, None);
+            self.ctx
+                .device
+                .destroy_image_view(self.voxel_image_view, None);
+            self.ctx.device.destroy_image(self.voxel_image, None);
+            self.ctx.device.free_memory(self.voxel_image_memory, None);
+
+            // Cleaning up descriptor pool automatically frees descriptor sets
+            self.ctx
+                .device
+                .destroy_descriptor_pool(self.descriptor_pool, None);
+            self.ctx
+                .device
+                .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+
+            for i in 0..MAX_FRAMES_IN_FLIGHT {
+                self.ctx
+                    .device
+                    .destroy_buffer(self.uniform_buffers[i], None);
+                self.ctx
+                    .device
+                    .free_memory(self.uniform_buffers_memory[i], None);
+            }
+
+            // Destroy graphics pipeline and layout
+            self.ctx
+                .device
+                .destroy_pipeline(self.graphics_pipeline, None);
+            self.ctx
+                .device
+                .destroy_pipeline_layout(self.pipeline_layout, None);
+
+            // Destroy framebuffers (one per swapchain image)
+            for &framebuffer in &self.swapchain_framebuffers {
+                self.ctx.device.destroy_framebuffer(framebuffer, None);
+            }
+
+            // Destroy image views (one per swapchain image)
+            for &image_view in &self.swapchain_image_views {
+                self.ctx.device.destroy_image_view(image_view, None);
+            }
+
+            // Destroy render pass
+            self.ctx.device.destroy_render_pass(self.render_pass, None);
+
+            // Destroy shader modules
+            self.ctx
+                .device
+                .destroy_shader_module(self.vert_shader_module, None);
+            self.ctx
+                .device
+                .destroy_shader_module(self.frag_shader_module, None);
+
+            // Destroy swapchain (note: images are destroyed automatically)
+            self.ctx
+                .swapchain_loader
+                .destroy_swapchain(self.swapchain, None);
+
+            // Destroy surface
+            self.ctx.surface_loader.destroy_surface(self.surface, None);
+
+            // // Destroy egui renderer and state
+            // drop(self.egui_renderer.lock().take());
+        }
+    }
+
+    unsafe fn create_voxel_buffer(
+        device: &ash::Device,
+        instance: &ash::Instance,
+        physical_device: &ash::vk::PhysicalDevice,
+    ) -> anyhow::Result<(vk::Buffer, vk::DeviceMemory)> {
+        let buffer = unsafe {
+            let info = vk::BufferCreateInfo::default()
+                .size(CHUNK_BYTES as u64)
+                .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+            device.create_buffer(&info, None)?
+        };
+
+        let memory = unsafe {
+            let mem_requirements = device.get_buffer_memory_requirements(buffer);
+            let memory_type_index = Self::find_memory_type(
+                instance,
+                physical_device.clone(),
+                mem_requirements.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )?;
+
+            let info = vk::MemoryAllocateInfo::default()
+                .allocation_size(CHUNK_BYTES as u64)
+                .memory_type_index(memory_type_index);
+
+            device.allocate_memory(&info, None)?
+        };
+
+        unsafe {
+            device.bind_buffer_memory(buffer, memory, 0)?;
+        }
+
+        let chunk = Chunk::new_sphere(ChunkCoords::new(0, 0, 0), CHUNK_SIZE as f32 / 2.0);
+
+        let data_ptr = unsafe {
+            device.map_memory(memory, 0, CHUNK_BYTES as u64, vk::MemoryMapFlags::empty())?
+                as *mut u8
+        };
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                chunk.data().as_ptr() as *const u8,
+                data_ptr,
+                CHUNK_BYTES,
+            );
+
+            device.unmap_memory(memory);
+        }
+
+        Ok((buffer, memory))
+    }
+
+    unsafe fn create_voxel_texture(
+        device: &ash::Device,
+        instance: &ash::Instance,
+        physical_device: &ash::vk::PhysicalDevice,
+    ) -> anyhow::Result<(vk::Image, vk::DeviceMemory, vk::ImageView, vk::Sampler)> {
+        let image = unsafe {
+            let info = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_3D)
+                .format(vk::Format::R8_UINT)
+                // .initial_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+                .mip_levels(1)
+                .array_layers(1)
+                .extent(vk::Extent3D {
+                    width: CHUNK_SIZE,
+                    height: CHUNK_SIZE,
+                    depth: CHUNK_SIZE,
+                });
+            device.create_image(&info, None)?
+        };
+
+        let memory = unsafe {
+            let mem_requirements = device.get_image_memory_requirements(image);
+            let memory_type_index = Self::find_memory_type(
+                instance,
+                physical_device.clone(),
+                mem_requirements.memory_type_bits,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            )
+            .context("Failed to find suitable memory type for voxel texture")?;
+
+            let info = vk::MemoryAllocateInfo::default()
+                .allocation_size(mem_requirements.size)
+                .memory_type_index(memory_type_index);
+
+            device.allocate_memory(&info, None)?
+        };
+
+        unsafe {
+            device.bind_image_memory(image, memory, 0)?;
+        }
+
+        let view = unsafe {
+            let info = vk::ImageViewCreateInfo::default()
+                .image(image.clone())
+                .view_type(vk::ImageViewType::TYPE_3D)
+                .format(vk::Format::R8_UINT)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .base_mip_level(0)
+                        .level_count(1)
+                        .base_array_layer(0)
+                        .layer_count(1),
+                );
+
+            device.create_image_view(&info, None)?
+        };
+
+        let sampler = unsafe {
+            let info = vk::SamplerCreateInfo::default()
+                .mag_filter(vk::Filter::NEAREST)
+                .min_filter(vk::Filter::NEAREST)
+                .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+                .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
+
+            device.create_sampler(&info, None)?
+        };
+
+        Ok((image, memory, view, sampler))
+    }
 
     unsafe fn draw_frame(
         &self,
@@ -406,248 +905,6 @@ impl RendererInner {
         }
 
         Ok(())
-    }
-
-    pub unsafe fn cleanup(&self) {
-        unsafe {
-            // Wait for all GPU work to finish before destroying anything
-            self.ctx.device.device_wait_idle().unwrap();
-
-            // Destroy synchronization objects (per-frame objects)
-            for i in 0..MAX_FRAMES_IN_FLIGHT {
-                self.ctx
-                    .device
-                    .destroy_semaphore(self.image_available_semaphores[i], None);
-                self.ctx
-                    .device
-                    .destroy_fence(self.in_flight_fences[i], None);
-            }
-
-            // Destroy per-swapchain-image semaphores
-            for i in 0..self.swapchain_images.len() {
-                self.ctx
-                    .device
-                    .destroy_semaphore(self.render_finished_semaphores[i], None);
-            }
-
-            // Destroy command pool (automatically frees command buffers)
-            self.ctx
-                .device
-                .destroy_command_pool(self.command_pool, None);
-
-            // Destroy cube shared buffers and memory
-            self.ctx
-                .device
-                .destroy_buffer(self.cube_vertex_buffer, None);
-            self.ctx
-                .device
-                .free_memory(self.cube_vertex_buffer_memory, None);
-
-            self.ctx.device.destroy_buffer(self.cube_index_buffer, None);
-            self.ctx
-                .device
-                .free_memory(self.cube_index_buffer_memory, None);
-
-            // Cleaning up descriptor pool automatically frees descriptor sets
-            self.ctx
-                .device
-                .destroy_descriptor_pool(self.descriptor_pool, None);
-            self.ctx
-                .device
-                .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
-
-            for i in 0..MAX_FRAMES_IN_FLIGHT {
-                self.ctx
-                    .device
-                    .destroy_buffer(self.uniform_buffers[i], None);
-                self.ctx
-                    .device
-                    .free_memory(self.uniform_buffers_memory[i], None);
-            }
-
-            // Destroy graphics pipeline and layout
-            self.ctx
-                .device
-                .destroy_pipeline(self.graphics_pipeline, None);
-            self.ctx
-                .device
-                .destroy_pipeline_layout(self.pipeline_layout, None);
-
-            // Destroy framebuffers (one per swapchain image)
-            for &framebuffer in &self.swapchain_framebuffers {
-                self.ctx.device.destroy_framebuffer(framebuffer, None);
-            }
-
-            // Destroy image views (one per swapchain image)
-            for &image_view in &self.swapchain_image_views {
-                self.ctx.device.destroy_image_view(image_view, None);
-            }
-
-            // Destroy render pass
-            self.ctx.device.destroy_render_pass(self.render_pass, None);
-
-            // Destroy shader modules
-            self.ctx
-                .device
-                .destroy_shader_module(self.vert_shader_module, None);
-            self.ctx
-                .device
-                .destroy_shader_module(self.frag_shader_module, None);
-
-            // Destroy swapchain (note: images are destroyed automatically)
-            self.ctx
-                .swapchain_loader
-                .destroy_swapchain(self.swapchain, None);
-
-            // Destroy surface
-            self.ctx.surface_loader.destroy_surface(self.surface, None);
-
-            // // Destroy egui renderer and state
-            // drop(self.egui_renderer.lock().take());
-        }
-    }
-
-    pub fn new(
-        ctx: &Arc<context::VkContext>,
-        ev: &winit::event_loop::ActiveEventLoop,
-    ) -> anyhow::Result<Self> {
-        let attrs = winit::window::Window::default_attributes()
-            .with_content_protected(false)
-            .with_title("rvoxel")
-            .with_visible(true);
-
-        let window = ev.create_window(attrs)?;
-
-        let surface = unsafe { Self::create_surface(&ctx.entry, &ctx.instance, &window)? };
-
-        let (swapchain, swapchain_loader, surface_format, extent) = unsafe {
-            Self::create_swap_chain(
-                &ctx.instance,
-                &ctx.physical_device,
-                &ctx.device,
-                &surface,
-                &ctx.surface_loader,
-                &window,
-            )?
-        };
-
-        let actual_window_size = window.inner_size();
-        tracing::debug!(
-            "Main window: after swapchain creation - window inner_size={:?}, swapchain extent={:?}",
-            actual_window_size,
-            extent
-        );
-        let swapchain_images = unsafe { swapchain_loader.get_swapchain_images(swapchain)? };
-
-        let command_pool =
-            unsafe { Self::create_command_pool(&ctx.device, ctx.graphics_queue_family_index)? };
-
-        let command_buffers = unsafe { Self::create_command_buffers(&ctx.device, &command_pool)? };
-
-        let (
-            image_available_semaphores,
-            render_finished_semaphores,
-            in_flight_fences,
-            images_in_flight,
-        ) = unsafe { Self::create_sync_objects(&ctx.device, swapchain_images.len())? };
-
-        let (cube_vertex_buffer, cube_vertex_buffer_memory) =
-            Self::create_vertex_buffer(&ctx.device, &ctx.instance, ctx.physical_device)?;
-
-        let (cube_index_buffer, cube_index_buffer_memory) =
-            unsafe { Self::create_index_buffer(&ctx.device, &ctx.instance, ctx.physical_device)? };
-
-        let descriptor_set_layout = unsafe { Self::create_descriptor_set_layout(&ctx.device) };
-        let descriptor_pool = unsafe { Self::create_descriptor_pool(&ctx.device) };
-        let (uniform_buffers, uniform_buffers_memory) = unsafe {
-            Self::create_uniform_buffers(&ctx.device, &ctx.instance, ctx.physical_device)?
-        };
-        let descriptor_sets = unsafe {
-            Self::create_descriptor_sets(
-                &ctx.device,
-                descriptor_pool,
-                descriptor_set_layout,
-                &uniform_buffers,
-            )?
-        };
-
-        let vert_shader_module = unsafe {
-            Self::create_shader_module(&ctx.device, &super::shaders::compile_vertex_shader()?)?
-        };
-        let frag_shader_module = unsafe {
-            Self::create_shader_module(&ctx.device, &super::shaders::compile_fragment_shader()?)?
-        };
-
-        let render_pass = unsafe { Self::create_render_pass(&ctx.device, surface_format.format)? };
-
-        let (graphics_pipeline, pipeline_layout) = Self::create_graphics_pipeline(
-            &ctx.device,
-            extent,
-            render_pass,
-            vert_shader_module,
-            frag_shader_module,
-            descriptor_set_layout,
-        )?;
-
-        let (swapchain_image_views, swapchain_framebuffers) = unsafe {
-            Self::create_framebuffers(
-                &ctx.device,
-                &swapchain_images,
-                render_pass,
-                extent,
-                surface_format.format,
-            )?
-        };
-
-        Ok(Self {
-            ctx: Arc::clone(ctx),
-
-            window: Arc::new(window),
-
-            surface,
-
-            swapchain,
-            swapchain_format: surface_format.format,
-            swapchain_extent: extent,
-            swapchain_images,
-            swapchain_framebuffers,
-            swapchain_image_views,
-
-            command_pool,
-            command_buffers,
-
-            image_available_semaphores,
-            render_finished_semaphores,
-            in_flight_fences,
-            images_in_flight,
-
-            current_frame: 0.into(),
-
-            // vertex_buffer,
-            // vertex_buffer_memory,
-            //
-            // index_buffer,
-            // index_buffer_memory,
-            cube_vertex_buffer,
-            cube_vertex_buffer_memory,
-
-            cube_index_buffer,
-            cube_index_buffer_memory,
-
-            uniform_buffers,
-            uniform_buffers_memory,
-
-            descriptor_set_layout,
-            descriptor_pool,
-            descriptor_sets,
-
-            vert_shader_module,
-            frag_shader_module,
-
-            render_pass,
-            graphics_pipeline,
-            pipeline_layout,
-        })
     }
 
     unsafe fn submit_commands(&self, image_index: u32) -> anyhow::Result<()> {
@@ -998,7 +1255,13 @@ impl RendererInner {
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT);
 
-        let bindings = [ubo_layout_binding];
+        let voxel_texture_binding = vk::DescriptorSetLayoutBinding::default()
+            .binding(1) // binding = 1 in shader
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT);
+
+        let bindings = [ubo_layout_binding, voxel_texture_binding];
         let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
 
         unsafe {
@@ -1013,6 +1276,8 @@ impl RendererInner {
         descriptor_pool: vk::DescriptorPool,
         descriptor_set_layout: vk::DescriptorSetLayout,
         uniform_buffers: &[vk::Buffer],
+        voxel_image_view: vk::ImageView,
+        voxel_sampler: vk::Sampler,
     ) -> anyhow::Result<Vec<vk::DescriptorSet>> {
         let layouts = vec![descriptor_set_layout; MAX_FRAMES_IN_FLIGHT];
 
@@ -1043,17 +1308,40 @@ impl RendererInner {
             unsafe { device.update_descriptor_sets(&[descriptor_write], &[]) };
         }
 
+        for descriptor_set in &descriptor_sets {
+            unsafe {
+                let info = vk::DescriptorImageInfo::default()
+                    .image_view(voxel_image_view)
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .sampler(voxel_sampler);
+
+                let write = vk::WriteDescriptorSet::default()
+                    .dst_set(*descriptor_set) // All sets use the same texture
+                    .dst_binding(1)
+                    .dst_array_element(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(std::slice::from_ref(&info));
+
+                device.update_descriptor_sets(&[write], &[]);
+            }
+        }
+
         tracing::info!("Descriptor sets created");
 
         Ok(descriptor_sets)
     }
 
     unsafe fn create_descriptor_pool(device: &ash::Device) -> vk::DescriptorPool {
-        let pool_size = vk::DescriptorPoolSize::default()
+        let uniform_buffer_size = vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::UNIFORM_BUFFER)
             .descriptor_count(MAX_FRAMES_IN_FLIGHT as u32);
 
-        let pool_sizes = [pool_size];
+        let voxel_texture_size = vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(MAX_FRAMES_IN_FLIGHT as u32);
+
+        let pool_sizes = [uniform_buffer_size, voxel_texture_size];
+
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .pool_sizes(&pool_sizes)
             .max_sets(MAX_FRAMES_IN_FLIGHT as u32);

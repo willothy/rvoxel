@@ -101,6 +101,8 @@ impl VkContext {
             .api_version(ash::vk::API_VERSION_1_0);
 
         let extension_names = vec![
+            // // synchronization2 for better synchronization primitives
+            // vk::KHR_SYNCHRONIZATION2_NAME.as_ptr(),
             // Surface and swapchain functionality
             vk::KHR_SURFACE_NAME.as_ptr(),
             //

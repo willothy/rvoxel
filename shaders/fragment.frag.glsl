@@ -12,6 +12,8 @@ layout(binding = 0) uniform UniformBufferObject {
     vec4 resolution;
 } ubo;
 
+layout(binding = 1) uniform usampler3D voxelTexture;
+
 // Output color
 layout(location = 0) out vec4 outColor;
 
@@ -79,7 +81,6 @@ void main() {
         vec3 light_dir = normalize(vec3(1.0, 1.0, -1.0));
 
         vec3 normal = calculateNormal(ray_origin + ray_dir_world * t);
-
 
         float ambient = 0.1;
         float diffuse = max(0.0, dot(normal, light_dir));
