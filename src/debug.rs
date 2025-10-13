@@ -582,10 +582,6 @@ impl DebugWindow {
                     self.vk_ctx.device.destroy_semaphore(semaphore, None);
                 }
 
-                for &fence in &inner.in_flight_fences {
-                    self.vk_ctx.device.destroy_fence(fence, None);
-                }
-
                 self.vk_ctx
                     .device
                     .destroy_command_pool(inner.command_pool, None);
