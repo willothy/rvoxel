@@ -33,6 +33,22 @@ pub struct Octree {
 }
 
 impl Octree {
+    pub fn new() -> Self {
+        Octree {
+            nodes: Vec::new(),
+            root: None,
+            max_depth: 0,
+        }
+    }
+
+    pub fn nodes(&self) -> &[OctreeNode] {
+        &self.nodes
+    }
+
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
     #[allow(unused)]
     pub(crate) fn stats(&self) -> (usize, usize) {
         let total_nodes = self.nodes.len();

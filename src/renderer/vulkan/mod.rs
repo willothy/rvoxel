@@ -13,15 +13,12 @@ use winit::window::Window;
 use parking_lot::RwLock;
 
 use crate::{
-    components::{
-        camera::Camera,
-        mesh::{Mesh, Vertex},
-        transform::Transform,
-    },
+    components::{camera::Camera, mesh::Vertex, transform::Transform},
     renderer::uniforms::UniformBufferObject,
     world::{
         chunk::{Chunk, CHUNK_BYTES},
         coords::{ChunkCoords, CHUNK_SIZE},
+        octree::{Octree, OctreeNode},
     },
 };
 
@@ -93,6 +90,12 @@ struct RendererInner {
 
     voxel_buffer: vk::Buffer,
     voxel_buffer_memory: vk::DeviceMemory,
+
+    // Stores the octree nodes after they have been submitted to the GPU.
+    //
+    // This is temporary since we will need to update this buffer when the world changes.
+    octree_buffer: vk::Buffer,
+    octree_buffer_memory: vk::DeviceMemory,
 
     // Shared mesh data
     cube_vertex_buffer: vk::Buffer,
@@ -414,6 +417,9 @@ impl RendererInner {
             ctx.device.free_command_buffers(command_pool, &[buffer]);
         }
 
+        let (octree_buffer, octree_buffer_memory) =
+            unsafe { Self::create_octree_buffers(&ctx, &command_pool, &Octree::new())? };
+
         Ok(Self {
             ctx: Arc::clone(ctx),
 
@@ -466,6 +472,9 @@ impl RendererInner {
 
             voxel_buffer,
             voxel_buffer_memory,
+
+            octree_buffer,
+            octree_buffer_memory,
 
             render_pass,
             graphics_pipeline,
@@ -521,6 +530,9 @@ impl RendererInner {
                 .destroy_image_view(self.voxel_image_view, None);
             self.ctx.device.destroy_image(self.voxel_image, None);
             self.ctx.device.free_memory(self.voxel_image_memory, None);
+
+            self.ctx.device.destroy_buffer(self.octree_buffer, None);
+            self.ctx.device.free_memory(self.octree_buffer_memory, None);
 
             // Cleaning up descriptor pool automatically frees descriptor sets
             self.ctx
@@ -815,6 +827,170 @@ impl RendererInner {
         };
 
         Ok(())
+    }
+
+    unsafe fn create_octree_buffers(
+        ctx: &Arc<context::VkContext>,
+        command_pool: &vk::CommandPool,
+        octree: &Octree,
+    ) -> anyhow::Result<(vk::Buffer, vk::DeviceMemory)> {
+        let buffer_size =
+            (std::mem::size_of::<OctreeNode>() * octree.node_count().max(1)) as vk::DeviceSize;
+
+        let (staging, staging_mem) = unsafe {
+            let buffer_info = vk::BufferCreateInfo::default()
+                .size(buffer_size)
+                .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+            let buffer = ctx.device.create_buffer(&buffer_info, None)?;
+
+            let mem_requirements = ctx.device.get_buffer_memory_requirements(buffer);
+            let memory_type_index = Self::find_memory_type(
+                &ctx.instance,
+                ctx.physical_device.clone(),
+                mem_requirements.memory_type_bits,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL | vk::MemoryPropertyFlags::HOST_VISIBLE,
+            )?;
+
+            let alloc_info = vk::MemoryAllocateInfo::default()
+                .allocation_size(mem_requirements.size)
+                .memory_type_index(memory_type_index);
+
+            let mem = ctx.device.allocate_memory(&alloc_info, None)?;
+
+            ctx.device.bind_buffer_memory(buffer, mem, 0)?;
+
+            let data_ptr =
+                ctx.device
+                    .map_memory(mem, 0, buffer_size, vk::MemoryMapFlags::empty())?
+                    as *mut OctreeNode;
+
+            std::ptr::copy_nonoverlapping(octree.nodes().as_ptr(), data_ptr, octree.node_count());
+
+            ctx.device.unmap_memory(mem);
+
+            (buffer, mem)
+        };
+
+        let (buf, mem) = unsafe {
+            let buffer_info = vk::BufferCreateInfo::default()
+                .size(buffer_size)
+                .usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+            let buffer = ctx.device.create_buffer(&buffer_info, None)?;
+
+            let mem_requirements = ctx.device.get_buffer_memory_requirements(buffer);
+            let memory_type_index = Self::find_memory_type(
+                &ctx.instance,
+                ctx.physical_device.clone(),
+                mem_requirements.memory_type_bits,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            )?;
+
+            let alloc_info = vk::MemoryAllocateInfo::default()
+                .allocation_size(mem_requirements.size)
+                .memory_type_index(memory_type_index);
+
+            let mem = ctx.device.allocate_memory(&alloc_info, None)?;
+
+            ctx.device.bind_buffer_memory(buffer, mem, 0)?;
+
+            (buffer, mem)
+        };
+
+        let alloc_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(command_pool.clone())
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+
+        let cmd_buffers = unsafe { ctx.device.allocate_command_buffers(&alloc_info)? };
+
+        if cmd_buffers.len() != 1 {
+            return Err(anyhow::anyhow!(
+                "Expected to allocate exactly 1 command buffer, got {}",
+                cmd_buffers.len()
+            ));
+        }
+
+        let command_buffer = cmd_buffers[0];
+
+        let begin = vk::CommandBufferBeginInfo::default();
+
+        unsafe {
+            ctx.device.begin_command_buffer(command_buffer, &begin)?;
+        }
+
+        let buffer_ready_barrier = vk::BufferMemoryBarrier::default()
+            .buffer(buf)
+            .size(buffer_size)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .src_access_mask(vk::AccessFlags::NONE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+
+        unsafe {
+            ctx.device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[buffer_ready_barrier],
+                &[],
+            );
+        }
+
+        let region = vk::BufferCopy::default()
+            .src_offset(0)
+            .dst_offset(0)
+            .size(buffer_size);
+
+        unsafe {
+            ctx.device
+                .cmd_copy_buffer(command_buffer, staging, buf, &[region]);
+        }
+
+        let buffer_write_barrier = vk::BufferMemoryBarrier::default()
+            .buffer(buf)
+            .size(buffer_size)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ);
+
+        unsafe {
+            ctx.device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[buffer_write_barrier],
+                &[],
+            );
+
+            ctx.device.end_command_buffer(command_buffer)?;
+        }
+
+        let submit_info =
+            vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&command_buffer));
+
+        unsafe {
+            ctx.device
+                .queue_submit(ctx.graphics_queue, &[submit_info], vk::Fence::null())?;
+
+            ctx.device.queue_wait_idle(ctx.graphics_queue)?;
+
+            ctx.device
+                .free_command_buffers(*command_pool, &[command_buffer]);
+
+            ctx.device.destroy_buffer(staging, None);
+            ctx.device.free_memory(staging_mem, None);
+        }
+
+        Ok((buf, mem))
     }
 
     unsafe fn update_uniform_buffer(&self, camera: &Camera, camera_transform: &Transform) {
