@@ -58,13 +58,6 @@ struct RendererInner {
     images_in_flight: Vec<RwLock<vk::Fence>>,
     current_frame: AtomicUsize,
 
-    // NOTE: old
-    // vertex_buffer: vk::Buffer,
-    // /// Actual GPU memory allocation for the vertex buffer.
-    // vertex_buffer_memory: vk::DeviceMemory,
-    //
-    // index_buffer: vk::Buffer,
-    // index_buffer_memory: vk::DeviceMemory,
     uniform_buffers: Vec<vk::Buffer>,
     uniform_buffers_memory: Vec<vk::DeviceMemory>,
 
