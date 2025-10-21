@@ -12,81 +12,119 @@ layout(binding = 0) uniform UniformBufferObject {
     vec4 resolution;
 } ubo;
 
-layout(binding = 1) uniform usampler3D voxelTexture;
+struct OctreeNode {
+    uint data;
+    uint children[8];
+};
+
+layout(binding = 1) readonly buffer OctreeBuffer {
+    OctreeNode nodes[];
+};
 
 // Output color
 layout(location = 0) out vec4 outColor;
 
-const int MAX_STEPS = 100;
-const float MAX_DISTANCE = 100.0;
-const float EPSILON = 0.001;
+bool isLeafNode(uint index) {
+    return (nodes[index].data >> 7) == 0u;
+}
 
-float sampleVoxel(vec3 pos, vec3 gridMin, vec3 gridMax) {
-    if (!all(greaterThanEqual(pos, gridMin)) || !all(lessThanEqual(pos, gridMax))) {
-        return 0.0;  // Outside grid
+bool isBranchNode(uint index) {
+    return (nodes[index].data >> 7) == 1u;
+}
+
+bool rayBoxIntersection(vec3 rayOrigin, vec3 rayDir, vec3 boxMin, vec3 boxMax, out float tEnter, out float tExit) {
+    vec3 t0s = (boxMin - rayOrigin) / rayDir;
+    vec3 t1s = (boxMax - rayOrigin) / rayDir;
+
+    vec3 tMin = min(t0s, t1s);
+    vec3 tMax = max(t0s, t1s);
+
+    tEnter = max(max(tMin.x, tMin.y), max(tMin.z, 0.0));
+    tExit = min(min(tMax.x, tMax.y), tMax.z);
+
+    return tEnter < tExit && tExit > 0;
+}
+
+void sortChildrenByOrder(vec3 ray, uint children[8], out uint traversalOrderedChildren[8]) {
+    uint i = 1;
+    uint dirMask = (ray.x < 0 ? 4 : 0) | (ray.y < 0 ? 2 : 0) | (ray.z < 0 ? 1 : 0);
+
+    for (uint i = 0; i < 8; i++) {
+        uint childIndex = i ^ dirMask;
+
+        // visit child
     }
-
-    vec3 texCoord = (pos - gridMin) / (gridMax - gridMin);
-    ivec3 voxelCoord = ivec3(texCoord * float(32));
-    uint voxelValue = texelFetch(voxelTexture, voxelCoord, 0).r;
-
-    return float(voxelValue);  // Convert to float for gradient calculation
 }
 
-vec3 calculateVoxelNormal(vec3 pos, vec3 gridMin, vec3 gridMax) {
-    float delta = 0.5;  // Small offset for sampling neighbors
+struct StackEntry {
+    uint nodeIndex;
+    vec3 boxMin;
+    vec3 boxMax;
+};
 
-    // Sample voxel density at 6 neighboring positions
-    // Convert each position to voxel coordinate and sample
+void subdivide(vec3 parentMin, vec3 parentMax, vec3 center, uint childIdx, out vec3 childMin, out vec3 childMax) {
+    bool xUpper = (childIdx & 4) != 0;
+    bool yUpper = (childIdx & 2) != 0;
+    bool zUpper = (childIdx & 1) != 0;
 
-    vec3 texCoord = (pos - gridMin) / (gridMax - gridMin);
-
-    // Sample in each axis direction
-    float dx_pos = sampleVoxel(pos + vec3(delta, 0, 0), gridMin, gridMax);
-    float dx_neg = sampleVoxel(pos - vec3(delta, 0, 0), gridMin, gridMax);
-    float dy_pos = sampleVoxel(pos + vec3(0, delta, 0), gridMin, gridMax);
-    float dy_neg = sampleVoxel(pos - vec3(0, delta, 0), gridMin, gridMax);
-    float dz_pos = sampleVoxel(pos + vec3(0, 0, delta), gridMin, gridMax);
-    float dz_neg = sampleVoxel(pos - vec3(0, 0, delta), gridMin, gridMax);
-
-    // Gradient = difference in each direction
-    vec3 normal = vec3(
-        dx_pos - dx_neg,
-        dy_pos - dy_neg,
-        dz_pos - dz_neg
-    );
-
-    return normalize(normal);
+    childMin = vec3(
+            xUpper ? center.x : parentMin.x,
+            yUpper ? center.y : parentMin.y,
+            zUpper ? center.z : parentMin.z
+        );
+    childMax = vec3(
+            xUpper ? parentMax.x : center.x,
+            yUpper ? parentMax.y : center.y,
+            zUpper ? parentMax.z : center.z
+        );
 }
 
-bool rayMarchVoxels(vec3 origin, vec3 direction, vec3 gridMin, vec3 gridMax, out vec3 hitPos) {
-    float t = 0.0;
-    float tMax = 50.0;  // Max distance to march
-    float stepSize = 0.1;  // Step size (smaller = more accurate but slower)
+bool traverseOctree(
+    vec3 rayOrigin,
+    vec3 rayDir,
+    vec3 gridMin,
+    vec3 gridMax,
+    out vec3 hitPos
+) {
+    StackEntry stack[64];
+    uint stackPtr = 0;
 
-    for (int i = 0; i < 500; i++) {
-        vec3 pos = origin + direction * t;
+    uint dirMask = (rayOrigin.x < 0 ? 4 : 0)
+            | (rayOrigin.y < 0 ? 2 : 0)
+            | (rayOrigin.z < 0 ? 1 : 0);
 
-        // Check if we're inside the grid bounds
-        if (all(greaterThanEqual(pos, gridMin)) && all(lessThanEqual(pos, gridMax))) {
-            // Convert world position to texture coordinates [0, 1]
-            vec3 texCoord = (pos - gridMin) / (gridMax - gridMin);
+    stack[stackPtr++] = StackEntry(0, gridMin, gridMax);
 
-            // Convert to voxel indices [0, 32)
-            ivec3 voxelCoord = ivec3(texCoord * float(32));  // CHUNK_SIZE = 32
+    while (stackPtr > 0) {
+        StackEntry entry = stack[--stackPtr];
+        OctreeNode node = nodes[entry.nodeIndex];
 
-            // Sample the voxel
-            uint voxelValue = texelFetch(voxelTexture, voxelCoord, 0).r;
-
-            if (voxelValue > 0u) {  // Non-empty voxel
-                hitPos = pos;
-                return true;
-            }
+        float tEnter, tExit;
+        if (!rayBoxIntersection(rayOrigin, rayDir, entry.boxMin, entry.boxMax, tEnter, tExit)) {
+            continue;
         }
 
-        t += stepSize;
-        if (t > tMax) {
-            break;
+        vec3 center = (entry.boxMin + entry.boxMax) * 0.5;
+        if (isLeafNode(entry.nodeIndex)) {
+            if ((node.data & 0x7f) != 0) {
+                hitPos = center;
+                return true;
+            }
+
+            continue;
+        }
+
+        for (uint i = 0; i < 8; i++) {
+            uint childIdx = i ^ dirMask;
+
+            vec3 childMin, childMax;
+            subdivide(entry.boxMin, entry.boxMax, center, childIdx, childMin, childMax);
+
+            stack[stackPtr++] = StackEntry(
+                    node.children[childIdx],
+                    childMin,
+                    childMax
+                );
         }
     }
 
@@ -102,34 +140,36 @@ void main() {
 
     mat3 camera_rotation = transpose(mat3(ubo.view));
 
-    vec3 ray_dir_camera = normalize(vec3(uv, -1.0));  // Assuming a simple camera looking down -Z
+    vec3 ray_dir_camera = normalize(vec3(uv, -1.0)); // Assuming a simple camera looking down -Z
 
     vec3 ray_dir_world = camera_rotation * ray_dir_camera;
 
     vec3 ray_origin = ubo.camera_position.xyz;
 
     // Position the grid in world space
-    vec3 gridMin = vec3(-16.0, -16.0, -16.0);  // Grid center
+    vec3 gridMin = vec3(-16.0, -16.0, -16.0); // Grid center
     vec3 gridMax = vec3(16.0, 16.0, 16.0);
 
     vec3 hitPos;
-    if (rayMarchVoxels(ray_origin, ray_dir_world, gridMin, gridMax, hitPos)) {
-        // Hit something - calculate normal and light it
-
-        vec3 light_dir = normalize(vec3(1.0, 1.0, -1.0));
-
-        // vec3 normal = calculateNormal(hitPos);
-        vec3 normal = calculateVoxelNormal(hitPos, gridMin, gridMax);
-
-        float ambient = 0.1;
-        float diffuse = max(0.0, dot(normal, light_dir));
-        float brightness = ambient + (1.0 - ambient) * diffuse;
-
-        outColor = vec4(
-            clamp(vec3(0.4, 0.6, 0.8) * brightness, 0.0, 1.0),
-            1.0
-        );
+    // if (rayMarchVoxels(ray_origin, ray_dir_world, gridMin, gridMax, hitPos)) {
+    //     // Hit something - calculate normal and light it
+    //
+    //     vec3 light_dir = normalize(vec3(1.0, 1.0, -1.0));
+    //
+    //     // vec3 normal = calculateNormal(hitPos);
+    //     vec3 normal = calculateVoxelNormal(hitPos, gridMin, gridMax);
+    //
+    //     float ambient = 0.1;
+    //     float diffuse = max(0.0, dot(normal, light_dir));
+    //     float brightness = ambient + (1.0 - ambient) * diffuse;
+    //
+    //     outColor = vec4(
+    //         clamp(vec3(0.4, 0.6, 0.8) * brightness, 0.0, 1.0),
+    //         1.0
+    //     );
+    if (traverseOctree(ray_origin, ray_dir_world, gridMin, gridMax, hitPos)) {
+        outColor = vec4(1.0, 0.0, 0.0, 1.0);
     } else {
-        outColor = vec4(0.1, 0.1, 0.1, 1.0);  // Miss: black color
+        outColor = vec4(0.1, 0.1, 0.1, 1.0); // Miss: black color
     }
 }

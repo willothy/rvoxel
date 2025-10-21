@@ -13,9 +13,45 @@ pub struct OctreeNode {
     child_indices: [u32; 8],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum NodeType {
+    Leaf = 0x00,
+    Branch = 0x01,
+}
+
 impl OctreeNode {
+    const TYPE_MASK: u8 = 0b1000_0000;
+
+    pub fn new_leaf(voxel: Voxel) -> Self {
+        OctreeNode {
+            data: (NodeType::Leaf as u8) << 7 | (voxel as u8),
+            child_indices: [0; 8],
+        }
+    }
+
+    pub fn new_branch(child_indices: [u32; 8]) -> Self {
+        OctreeNode {
+            data: (NodeType::Branch as u8) << 7,
+            child_indices,
+        }
+    }
+
+    #[inline(always)]
     pub fn is_leaf(&self) -> bool {
-        self.child_indices.iter().all(|&idx| idx == 0)
+        let flag = (self.data & Self::TYPE_MASK) >> 7;
+        flag == NodeType::Leaf as u8
+    }
+
+    #[inline(always)]
+    pub fn is_branch(&self) -> bool {
+        let flag = (self.data & Self::TYPE_MASK) >> 7;
+        flag == NodeType::Branch as u8
+    }
+
+    #[inline(always)]
+    pub fn data(&self) -> u8 {
+        self.data & !Self::TYPE_MASK
     }
 
     pub fn voxel(&self) -> Voxel {
@@ -168,9 +204,31 @@ mod tests {
         let (total_nodes, leaf_nodes) = octree.stats();
         println!("Total nodes: {}", total_nodes);
         println!("Leaf nodes: {}", leaf_nodes);
-        assert!(false);
 
         assert!(total_nodes > 1);
         assert!(leaf_nodes > 1);
+    }
+
+    #[test]
+    fn test_octree_masks() {
+        use crate::world::octree::{NodeType, OctreeNode};
+
+        let leaf_node = OctreeNode {
+            data: ((NodeType::Leaf as u8) << 7) | 0x05,
+            child_indices: [0; 8],
+        };
+
+        let branch_node = OctreeNode {
+            data: ((NodeType::Branch as u8) << 7) | 0x00,
+            child_indices: [1, 2, 3, 4, 5, 6, 7, 8],
+        };
+
+        assert!(leaf_node.is_leaf());
+        assert!(!leaf_node.is_branch());
+        assert_eq!(leaf_node.data(), 0x05);
+
+        assert!(branch_node.is_branch());
+        assert!(!branch_node.is_leaf());
+        assert_eq!(branch_node.data(), 0x00);
     }
 }

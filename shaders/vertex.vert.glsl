@@ -21,13 +21,14 @@ layout(push_constant) uniform PushConstants {
 layout(location = 0) out vec3 fragColor;
 layout(location = 1) out vec3 fragNormal;
 
+
 vec2 verts(uint i) {
     // 0: (-1,-1), 1: ( 3,-1), 2: (-1, 3)
     const vec2 pos[3] = vec2[](
-        vec2(-1.0, -1.0),
-        vec2( 3.0, -1.0),
-        vec2(-1.0,  3.0)
-    );
+            vec2(-1.0, -1.0),
+            vec2(3.0, -1.0),
+            vec2(-1.0, 3.0)
+        );
     return pos[i];
 }
 
