@@ -15,11 +15,7 @@ use parking_lot::RwLock;
 use crate::{
     components::{camera::Camera, mesh::Vertex, transform::Transform},
     renderer::uniforms::UniformBufferObject,
-    world::{
-        chunk::{Chunk, CHUNK_BYTES},
-        coords::{ChunkCoords, CHUNK_SIZE},
-        octree::{Octree, OctreeNode},
-    },
+    world::octree::{Octree, OctreeNode},
 };
 
 pub mod context;
@@ -83,14 +79,6 @@ struct RendererInner {
     graphics_pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
 
-    voxel_image: vk::Image,
-    voxel_image_memory: vk::DeviceMemory,
-    voxel_image_view: vk::ImageView,
-    voxel_sampler: vk::Sampler,
-
-    voxel_buffer: vk::Buffer,
-    voxel_buffer_memory: vk::DeviceMemory,
-
     // Stores the octree nodes after they have been submitted to the GPU.
     //
     // This is temporary since we will need to update this buffer when the world changes.
@@ -98,10 +86,10 @@ struct RendererInner {
     octree_buffer_memory: vk::DeviceMemory,
 
     // Shared mesh data
-    cube_vertex_buffer: vk::Buffer,
-    cube_vertex_buffer_memory: vk::DeviceMemory,
-    cube_index_buffer: vk::Buffer,
-    cube_index_buffer_memory: vk::DeviceMemory,
+    fsquad_vertex_buffer: vk::Buffer,
+    fsquad_vertex_buffer_memory: vk::DeviceMemory,
+    fsquad_index_buffer: vk::Buffer,
+    fsquad_index_buffer_memory: vk::DeviceMemory,
 }
 
 pub struct DebugState {
@@ -249,25 +237,22 @@ impl RendererInner {
         let (cube_index_buffer, cube_index_buffer_memory) =
             unsafe { Self::create_index_buffer(&ctx.device, &ctx.instance, ctx.physical_device)? };
 
-        let (voxel_image, voxel_image_memory, voxel_image_view, voxel_sampler) = unsafe {
-            Self::create_voxel_texture(&ctx.device, &ctx.instance, &ctx.physical_device)?
-        };
-        let (voxel_buffer, voxel_buffer_memory) =
-            unsafe { Self::create_voxel_buffer(&ctx.device, &ctx.instance, &ctx.physical_device)? };
-
         let descriptor_set_layout = unsafe { Self::create_descriptor_set_layout(&ctx.device) };
         let descriptor_pool = unsafe { Self::create_descriptor_pool(&ctx.device) };
         let (uniform_buffers, uniform_buffers_memory) = unsafe {
             Self::create_uniform_buffers(&ctx.device, &ctx.instance, ctx.physical_device)?
         };
+
+        let (octree_buffer, octree_buffer_memory) =
+            unsafe { Self::create_octree_buffers(&ctx, &command_pool, &Octree::new())? };
+
         let descriptor_sets = unsafe {
             Self::create_descriptor_sets(
                 &ctx.device,
                 descriptor_pool,
                 descriptor_set_layout,
                 &uniform_buffers,
-                voxel_image_view.clone(),
-                voxel_sampler.clone(),
+                octree_buffer,
             )?
         };
 
@@ -299,127 +284,6 @@ impl RendererInner {
             )?
         };
 
-        unsafe {
-            let alloc_info = vk::CommandBufferAllocateInfo::default()
-                .command_pool(command_pool.clone())
-                .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(1);
-
-            let buffers = ctx.device.allocate_command_buffers(&alloc_info)?;
-
-            if buffers.len() != 1 {
-                return Err(anyhow::anyhow!(
-                    "Expected to allocate exactly 1 command buffer, got {}",
-                    buffers.len()
-                ));
-            }
-
-            let buffer = buffers[0];
-
-            let begin = vk::CommandBufferBeginInfo::default();
-
-            ctx.device.begin_command_buffer(buffer, &begin)?;
-
-            {
-                let image_barrier = vk::ImageMemoryBarrier::default()
-                    .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(voxel_image)
-                    .subresource_range(
-                        vk::ImageSubresourceRange::default()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .base_mip_level(0)
-                            .level_count(1)
-                            .base_array_layer(0)
-                            .layer_count(1),
-                    )
-                    .src_access_mask(vk::AccessFlags::NONE)
-                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
-
-                ctx.device.cmd_pipeline_barrier(
-                    buffer,
-                    vk::PipelineStageFlags::TOP_OF_PIPE,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[image_barrier],
-                );
-            }
-
-            let region = vk::BufferImageCopy::default()
-                .buffer_offset(0)
-                .buffer_row_length(0)
-                .buffer_image_height(0)
-                .image_subresource(
-                    vk::ImageSubresourceLayers::default()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                        .mip_level(0)
-                        .base_array_layer(0)
-                        .layer_count(1),
-                )
-                .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
-                .image_extent(vk::Extent3D {
-                    width: CHUNK_SIZE,
-                    height: CHUNK_SIZE,
-                    depth: CHUNK_SIZE,
-                });
-
-            ctx.device.cmd_copy_buffer_to_image(
-                buffer,
-                voxel_buffer,
-                voxel_image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[region],
-            );
-
-            {
-                let image_barrier = vk::ImageMemoryBarrier::default()
-                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(voxel_image)
-                    .subresource_range(
-                        vk::ImageSubresourceRange::default()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .base_mip_level(0)
-                            .level_count(1)
-                            .base_array_layer(0)
-                            .layer_count(1),
-                    )
-                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ);
-
-                ctx.device.cmd_pipeline_barrier(
-                    buffer,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::FRAGMENT_SHADER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[image_barrier],
-                );
-            }
-
-            ctx.device.end_command_buffer(buffer)?;
-
-            let submit_info =
-                vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&buffer));
-
-            ctx.device
-                .queue_submit(ctx.graphics_queue, &[submit_info], vk::Fence::null())?;
-
-            ctx.device.queue_wait_idle(ctx.graphics_queue)?;
-
-            ctx.device.free_command_buffers(command_pool, &[buffer]);
-        }
-
-        let (octree_buffer, octree_buffer_memory) =
-            unsafe { Self::create_octree_buffers(&ctx, &command_pool, &Octree::new())? };
-
         Ok(Self {
             ctx: Arc::clone(ctx),
 
@@ -449,11 +313,11 @@ impl RendererInner {
             //
             // index_buffer,
             // index_buffer_memory,
-            cube_vertex_buffer,
-            cube_vertex_buffer_memory,
+            fsquad_vertex_buffer: cube_vertex_buffer,
+            fsquad_vertex_buffer_memory: cube_vertex_buffer_memory,
 
-            cube_index_buffer,
-            cube_index_buffer_memory,
+            fsquad_index_buffer: cube_index_buffer,
+            fsquad_index_buffer_memory: cube_index_buffer_memory,
 
             uniform_buffers,
             uniform_buffers_memory,
@@ -464,14 +328,6 @@ impl RendererInner {
 
             vert_shader_module,
             frag_shader_module,
-
-            voxel_image,
-            voxel_image_memory,
-            voxel_image_view,
-            voxel_sampler,
-
-            voxel_buffer,
-            voxel_buffer_memory,
 
             octree_buffer,
             octree_buffer_memory,
@@ -512,24 +368,17 @@ impl RendererInner {
             // Destroy cube shared buffers and memory
             self.ctx
                 .device
-                .destroy_buffer(self.cube_vertex_buffer, None);
+                .destroy_buffer(self.fsquad_vertex_buffer, None);
             self.ctx
                 .device
-                .free_memory(self.cube_vertex_buffer_memory, None);
+                .free_memory(self.fsquad_vertex_buffer_memory, None);
 
-            self.ctx.device.destroy_buffer(self.cube_index_buffer, None);
             self.ctx
                 .device
-                .free_memory(self.cube_index_buffer_memory, None);
-
-            self.ctx.device.destroy_buffer(self.voxel_buffer, None);
-            self.ctx.device.free_memory(self.voxel_buffer_memory, None);
-            self.ctx.device.destroy_sampler(self.voxel_sampler, None);
+                .destroy_buffer(self.fsquad_index_buffer, None);
             self.ctx
                 .device
-                .destroy_image_view(self.voxel_image_view, None);
-            self.ctx.device.destroy_image(self.voxel_image, None);
-            self.ctx.device.free_memory(self.voxel_image_memory, None);
+                .free_memory(self.fsquad_index_buffer_memory, None);
 
             self.ctx.device.destroy_buffer(self.octree_buffer, None);
             self.ctx.device.free_memory(self.octree_buffer_memory, None);
@@ -591,135 +440,6 @@ impl RendererInner {
             // // Destroy egui renderer and state
             // drop(self.egui_renderer.lock().take());
         }
-    }
-
-    unsafe fn create_voxel_buffer(
-        device: &ash::Device,
-        instance: &ash::Instance,
-        physical_device: &ash::vk::PhysicalDevice,
-    ) -> anyhow::Result<(vk::Buffer, vk::DeviceMemory)> {
-        let buffer = unsafe {
-            let info = vk::BufferCreateInfo::default()
-                .size(CHUNK_BYTES as u64)
-                .usage(vk::BufferUsageFlags::TRANSFER_SRC)
-                .sharing_mode(vk::SharingMode::EXCLUSIVE);
-
-            device.create_buffer(&info, None)?
-        };
-
-        let memory = unsafe {
-            let mem_requirements = device.get_buffer_memory_requirements(buffer);
-            let memory_type_index = Self::find_memory_type(
-                instance,
-                physical_device.clone(),
-                mem_requirements.memory_type_bits,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            )?;
-
-            let info = vk::MemoryAllocateInfo::default()
-                .allocation_size(CHUNK_BYTES as u64)
-                .memory_type_index(memory_type_index);
-
-            device.allocate_memory(&info, None)?
-        };
-
-        unsafe {
-            device.bind_buffer_memory(buffer, memory, 0)?;
-        }
-
-        let chunk = Chunk::new_sphere(ChunkCoords::new(0, 0, 0), CHUNK_SIZE as f32 / 2.0);
-
-        let data_ptr = unsafe {
-            device.map_memory(memory, 0, CHUNK_BYTES as u64, vk::MemoryMapFlags::empty())?
-                as *mut u8
-        };
-
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                chunk.data().as_ptr() as *const u8,
-                data_ptr,
-                CHUNK_BYTES,
-            );
-
-            device.unmap_memory(memory);
-        }
-
-        Ok((buffer, memory))
-    }
-
-    unsafe fn create_voxel_texture(
-        device: &ash::Device,
-        instance: &ash::Instance,
-        physical_device: &ash::vk::PhysicalDevice,
-    ) -> anyhow::Result<(vk::Image, vk::DeviceMemory, vk::ImageView, vk::Sampler)> {
-        let image = unsafe {
-            let info = vk::ImageCreateInfo::default()
-                .image_type(vk::ImageType::TYPE_3D)
-                .format(vk::Format::R8_UINT)
-                // .initial_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .samples(vk::SampleCountFlags::TYPE_1)
-                .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
-                .mip_levels(1)
-                .array_layers(1)
-                .extent(vk::Extent3D {
-                    width: CHUNK_SIZE,
-                    height: CHUNK_SIZE,
-                    depth: CHUNK_SIZE,
-                });
-            device.create_image(&info, None)?
-        };
-
-        let memory = unsafe {
-            let mem_requirements = device.get_image_memory_requirements(image);
-            let memory_type_index = Self::find_memory_type(
-                instance,
-                physical_device.clone(),
-                mem_requirements.memory_type_bits,
-                vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            )
-            .context("Failed to find suitable memory type for voxel texture")?;
-
-            let info = vk::MemoryAllocateInfo::default()
-                .allocation_size(mem_requirements.size)
-                .memory_type_index(memory_type_index);
-
-            device.allocate_memory(&info, None)?
-        };
-
-        unsafe {
-            device.bind_image_memory(image, memory, 0)?;
-        }
-
-        let view = unsafe {
-            let info = vk::ImageViewCreateInfo::default()
-                .image(image.clone())
-                .view_type(vk::ImageViewType::TYPE_3D)
-                .format(vk::Format::R8_UINT)
-                .subresource_range(
-                    vk::ImageSubresourceRange::default()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                        .base_mip_level(0)
-                        .level_count(1)
-                        .base_array_layer(0)
-                        .layer_count(1),
-                );
-
-            device.create_image_view(&info, None)?
-        };
-
-        let sampler = unsafe {
-            let info = vk::SamplerCreateInfo::default()
-                .mag_filter(vk::Filter::NEAREST)
-                .min_filter(vk::Filter::NEAREST)
-                .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
-                .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
-
-            device.create_sampler(&info, None)?
-        };
-
-        Ok((image, memory, view, sampler))
     }
 
     unsafe fn draw_frame(
@@ -1174,34 +894,39 @@ impl RendererInner {
             )
         };
 
-        let swapchain_extent = self.swapchain_extent;
+        // Update viewport and scissor
+        //
+        // TODO: Should we only do this if the window was resized?
+        {
+            let swapchain_extent = self.swapchain_extent;
 
-        // 4. Viewport and scissor - what part of screen to render to
-        let viewports = [vk::Viewport {
-            x: 0.0,
-            y: 0.0,
-            width: swapchain_extent.width as f32,
-            height: swapchain_extent.height as f32,
-            min_depth: 0.0,
-            max_depth: 1.0,
-        }];
+            // 4. Viewport and scissor - what part of screen to render to
+            let viewports = [vk::Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: swapchain_extent.width as f32,
+                height: swapchain_extent.height as f32,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            }];
 
-        let scissors = [vk::Rect2D {
-            offset: vk::Offset2D { x: 0, y: 0 },
-            extent: swapchain_extent,
-        }];
+            let scissors = [vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: swapchain_extent,
+            }];
 
-        unsafe {
-            self.ctx
-                .device
-                .cmd_set_viewport(command_buffer, 0, &viewports);
-            self.ctx
-                .device
-                .cmd_set_scissor(command_buffer, 0, &scissors);
+            unsafe {
+                self.ctx
+                    .device
+                    .cmd_set_viewport(command_buffer, 0, &viewports);
+                self.ctx
+                    .device
+                    .cmd_set_scissor(command_buffer, 0, &scissors);
+            }
         }
 
-        // Bind vertex buffer
-        let vertex_buffers = [self.cube_vertex_buffer];
+        // Bind vertex buffer and draw full-screen quad
+        let vertex_buffers = [self.fsquad_vertex_buffer];
         let offsets = [0];
         unsafe {
             self.ctx
@@ -1210,7 +935,7 @@ impl RendererInner {
 
             self.ctx.device.cmd_bind_index_buffer(
                 command_buffer,
-                self.cube_index_buffer,
+                self.fsquad_index_buffer,
                 0,
                 vk::IndexType::UINT16,
             );
@@ -1431,13 +1156,13 @@ impl RendererInner {
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT);
 
-        let voxel_texture_binding = vk::DescriptorSetLayoutBinding::default()
-            .binding(1) // binding = 1 in shader
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        let octree_buffer_binding = vk::DescriptorSetLayoutBinding::default()
+            .binding(1)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::FRAGMENT);
 
-        let bindings = [ubo_layout_binding, voxel_texture_binding];
+        let bindings = [ubo_layout_binding, octree_buffer_binding];
         let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
 
         unsafe {
@@ -1452,8 +1177,7 @@ impl RendererInner {
         descriptor_pool: vk::DescriptorPool,
         descriptor_set_layout: vk::DescriptorSetLayout,
         uniform_buffers: &[vk::Buffer],
-        voxel_image_view: vk::ImageView,
-        voxel_sampler: vk::Sampler,
+        octree_buffer: vk::Buffer,
     ) -> anyhow::Result<Vec<vk::DescriptorSet>> {
         let layouts = vec![descriptor_set_layout; MAX_FRAMES_IN_FLIGHT];
 
@@ -1486,17 +1210,17 @@ impl RendererInner {
 
         for descriptor_set in &descriptor_sets {
             unsafe {
-                let info = vk::DescriptorImageInfo::default()
-                    .image_view(voxel_image_view)
-                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .sampler(voxel_sampler);
+                let info = vk::DescriptorBufferInfo::default()
+                    .buffer(octree_buffer)
+                    .offset(0)
+                    .range(vk::WHOLE_SIZE);
 
                 let write = vk::WriteDescriptorSet::default()
                     .dst_set(*descriptor_set) // All sets use the same texture
                     .dst_binding(1)
                     .dst_array_element(0)
-                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .image_info(std::slice::from_ref(&info));
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(std::slice::from_ref(&info));
 
                 device.update_descriptor_sets(&[write], &[]);
             }
@@ -1512,11 +1236,11 @@ impl RendererInner {
             .ty(vk::DescriptorType::UNIFORM_BUFFER)
             .descriptor_count(MAX_FRAMES_IN_FLIGHT as u32);
 
-        let voxel_texture_size = vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        let octree_buffer_size = vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::STORAGE_BUFFER)
             .descriptor_count(MAX_FRAMES_IN_FLIGHT as u32);
 
-        let pool_sizes = [uniform_buffer_size, voxel_texture_size];
+        let pool_sizes = [uniform_buffer_size, octree_buffer_size];
 
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .pool_sizes(&pool_sizes)
